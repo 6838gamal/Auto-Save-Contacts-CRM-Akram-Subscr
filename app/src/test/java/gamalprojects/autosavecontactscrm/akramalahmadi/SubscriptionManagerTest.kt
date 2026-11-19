@@ -702,4 +702,194 @@ class SubscriptionManagerTest {
         assertEquals(1, syncedBatches.single().size)
         assertEquals("967770002222", syncedBatches.single().single().phone)
     }
+
+    @Test
+    fun `instant local launch check and active cached subscription work seamlessly when offline`() = runTest {
+        val futureExpiry = System.currentTimeMillis() + 7L * 24L * 60L * 60L * 1000L
+        var isOnline = true
+
+        val api = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                if (!isOnline) throw IOException("No internet")
+                return Response.success(SubscriptionApiResponse(valid = true, isSubscribed = true, isActive = true))
+            }
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(
+                    SubscriptionApiResponse(
+                        valid = true,
+                        isSubscribed = true,
+                        isActive = true,
+                        code = request.code,
+                        planLabel = "اشتراك شهري",
+                        maxContacts = 500,
+                        usedContacts = 0,
+                        expiresAt = futureExpiry,
+                        boundUserId = request.userId,
+                        boundIp = request.publicIp
+                    )
+                )
+            }
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> {
+                if (!isOnline) throw IOException("No internet")
+                return Response.success(SubscriptionApiResponse(valid = true, isSubscribed = true, isActive = true))
+            }
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun syncClients(
+                authorization: String?,
+                apiKey: String?,
+                request: ClientSyncBatchRequest
+            ): Response<SubscriptionApiResponse> {
+                if (!isOnline) throw IOException("No internet")
+                return Response.success(SubscriptionApiResponse(valid = true))
+            }
+        }
+
+        val repo = SubscriptionRepository(db, apiServiceOverride = api)
+
+        // Fresh install: instant local check allows access immediately
+        val freshQuick = repo.checkLocalAccessQuick(context)
+        assertTrue(freshQuick.isAllowed)
+        assertNull(freshQuick.activeInfo)
+
+        // Activate subscription while online
+        val act = repo.activateSubscriptionCode(context, "OFFLINE-VIP-1")
+        assertTrue(act is ActivationResult.Success)
+
+        // Go completely offline -> both quick check and verifyCurrentSession allow user to continue
+        isOnline = false
+        val offlineQuick = repo.checkLocalAccessQuick(context)
+        assertTrue(offlineQuick.isAllowed)
+        assertNotNull(offlineQuick.activeInfo)
+
+        val offlineVerify = repo.verifyCurrentSession(context)
+        assertTrue(offlineVerify.isAllowed)
+        assertNotNull(offlineVerify.activeInfo)
+        assertTrue(offlineVerify.dbStatus is DbConnectionStatus.Disconnected)
+    }
+
+    @Test
+    fun `free plan users still send telemetry and clients to backend with explicit free plan indicator`() = runTest {
+        val connectRequests = mutableListOf<SubscriptionConnectRequest>()
+        val clientRequests = mutableListOf<ClientSyncBatchRequest>()
+
+        val trackingApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                connectRequests.add(request)
+                return Response.success(SubscriptionApiResponse(valid = true, isSubscribed = false, isActive = true))
+            }
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = false))
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = false))
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun syncClients(
+                authorization: String?,
+                apiKey: String?,
+                request: ClientSyncBatchRequest
+            ): Response<SubscriptionApiResponse> {
+                clientRequests.add(request)
+                return Response.success(SubscriptionApiResponse(valid = true, status = "synced"))
+            }
+        }
+
+        val repo = SubscriptionRepository(db, apiServiceOverride = trackingApi)
+
+        // 1. Initial launch on free plan sends telemetry with FREE planType and 100 limit
+        val launchOutcome = repo.verifyCurrentSession(context)
+        assertTrue(launchOutcome.isAllowed)
+        assertTrue(connectRequests.isNotEmpty())
+        val initialTelemetry = connectRequests.last()
+        assertEquals("FREE", initialTelemetry.planType)
+        assertEquals(100, initialTelemetry.freeContactsLimit)
+        assertEquals(0, initialTelemetry.freeContactsUsed)
+        assertFalse(initialTelemetry.freeTierExhausted)
+        assertNull(initialTelemetry.activeCode)
+
+        // 2. Saving a contact + syncing client on free plan sends live usage and client with planType = FREE
+        val freeContact = Contact(
+            name = "عميل مجاني",
+            phone = "967771234567",
+            originalPhone = "+967771234567",
+            source = "واتساب",
+            interactionCount = 1,
+            isSyncedToPhone = false
+        )
+        db.contactDao().insertContact(freeContact)
+        assertTrue(repo.recordContactSaved(context))
+        assertTrue(repo.syncSingleClientToDatabase(context, freeContact, isDeleted = false))
+
+        val afterFirstSave = connectRequests.last()
+        assertEquals("FREE", afterFirstSave.planType)
+        assertEquals(1, afterFirstSave.freeContactsUsed)
+        assertEquals(100, afterFirstSave.freeContactsLimit)
+        assertFalse(afterFirstSave.freeTierExhausted)
+        assertNull(afterFirstSave.activeCode)
+
+        assertTrue(clientRequests.isNotEmpty())
+        assertEquals("FREE", clientRequests.last().planType)
+        assertEquals("967771234567", clientRequests.last().clients.single().phone)
+
+        // 3. Reaching 100th free contact syncs FREE_EXHAUSTED state to backend
+        repeat(98) {
+            assertTrue(repo.recordContactSaved(context))
+        }
+        assertFalse(repo.recordContactSaved(context))
+
+        val exhaustedTelemetry = connectRequests.last()
+        assertEquals("FREE_EXHAUSTED", exhaustedTelemetry.planType)
+        assertEquals(100, exhaustedTelemetry.freeContactsUsed)
+        assertEquals(100, exhaustedTelemetry.freeContactsLimit)
+        assertTrue(exhaustedTelemetry.freeTierExhausted)
+        assertNull(exhaustedTelemetry.activeCode)
+    }
 }

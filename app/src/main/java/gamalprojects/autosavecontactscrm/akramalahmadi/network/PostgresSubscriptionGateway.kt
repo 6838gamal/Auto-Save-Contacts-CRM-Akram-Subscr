@@ -372,10 +372,33 @@ class PostgresSubscriptionGateway(
             client.query(
                 """
                 UPDATE crm_users
-                SET saved_contacts_count = $2::int, public_ip = $3, last_seen_at = NOW()
+                SET saved_contacts_count = $2::int,
+                    public_ip = $3,
+                    plan_type = 'SUBSCRIBED',
+                    is_subscribed = TRUE,
+                    last_seen_at = NOW()
                 WHERE user_id = $1
                 """.trimIndent(),
                 listOf(snapshot.userId, totalContacts.toString(), snapshot.publicIp)
+            )
+        }
+    }
+
+    fun reportFreeUsage(
+        snapshot: UserNetworkSnapshot,
+        totalContacts: Int,
+        freeState: FreeAccessState
+    ) {
+        clientFactory(config).use { client ->
+            client.connect()
+            ensureSchema(client)
+            upsertUserTelemetry(
+                client = client,
+                snapshot = snapshot,
+                totalContacts = totalContacts,
+                freeState = freeState,
+                activeCode = null,
+                isSubscribed = false
             )
         }
     }
@@ -419,7 +442,8 @@ class PostgresSubscriptionGateway(
 
     fun syncClientsBatch(
         userId: String,
-        clients: List<ClientSyncItem>
+        clients: List<ClientSyncItem>,
+        planType: String = "FREE"
     ) {
         if (clients.isEmpty()) return
         clientFactory(config).use { client ->
@@ -431,12 +455,12 @@ class PostgresSubscriptionGateway(
                     INSERT INTO crm_clients (
                         user_id, phone, original_phone, name, source,
                         created_at, last_activity, interaction_count,
-                        is_synced_to_phone, is_deleted, updated_at
+                        is_synced_to_phone, is_deleted, plan_type, updated_at
                     )
                     VALUES (
                         $1, $2, $3, $4, $5,
                         $6::bigint, $7::bigint, $8::int,
-                        $9::boolean, $10::boolean, NOW()
+                        $9::boolean, $10::boolean, $11, NOW()
                     )
                     ON CONFLICT (user_id, phone) DO UPDATE SET
                         original_phone = EXCLUDED.original_phone,
@@ -446,6 +470,7 @@ class PostgresSubscriptionGateway(
                         interaction_count = GREATEST(crm_clients.interaction_count, EXCLUDED.interaction_count),
                         is_synced_to_phone = crm_clients.is_synced_to_phone OR EXCLUDED.is_synced_to_phone,
                         is_deleted = EXCLUDED.is_deleted,
+                        plan_type = EXCLUDED.plan_type,
                         updated_at = NOW()
                     """.trimIndent(),
                     listOf(
@@ -458,7 +483,8 @@ class PostgresSubscriptionGateway(
                         item.lastActivity.toString(),
                         item.interactionCount.toString(),
                         item.isSyncedToPhone.toString(),
-                        item.isDeleted.toString()
+                        item.isDeleted.toString(),
+                        planType
                     )
                 )
             }
@@ -480,7 +506,9 @@ class PostgresSubscriptionGateway(
                 network_type TEXT NOT NULL DEFAULT '',
                 saved_contacts_count INTEGER NOT NULL DEFAULT 0,
                 free_contacts_used INTEGER NOT NULL DEFAULT 0,
+                free_contacts_limit INTEGER NOT NULL DEFAULT 100,
                 free_tier_exhausted BOOLEAN NOT NULL DEFAULT FALSE,
+                plan_type TEXT NOT NULL DEFAULT 'FREE',
                 active_code TEXT,
                 is_subscribed BOOLEAN NOT NULL DEFAULT FALSE,
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -488,6 +516,12 @@ class PostgresSubscriptionGateway(
                 last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """.trimIndent()
+        )
+        client.executeSimple(
+            "ALTER TABLE crm_users ADD COLUMN IF NOT EXISTS plan_type TEXT NOT NULL DEFAULT 'FREE'"
+        )
+        client.executeSimple(
+            "ALTER TABLE crm_users ADD COLUMN IF NOT EXISTS free_contacts_limit INTEGER NOT NULL DEFAULT 100"
         )
         client.executeSimple(
             """
@@ -543,10 +577,14 @@ class PostgresSubscriptionGateway(
                 interaction_count INTEGER NOT NULL DEFAULT 1,
                 is_synced_to_phone BOOLEAN NOT NULL DEFAULT FALSE,
                 is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                plan_type TEXT NOT NULL DEFAULT 'FREE',
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (user_id, phone)
             )
             """.trimIndent()
+        )
+        client.executeSimple(
+            "ALTER TABLE crm_clients ADD COLUMN IF NOT EXISTS plan_type TEXT NOT NULL DEFAULT 'FREE'"
         )
     }
 
@@ -558,19 +596,24 @@ class PostgresSubscriptionGateway(
         activeCode: String?,
         isSubscribed: Boolean
     ) {
+        val planType = when {
+            isSubscribed -> "SUBSCRIBED"
+            freeState.isExhausted -> "FREE_EXHAUSTED"
+            else -> "FREE"
+        }
         client.query(
             """
             INSERT INTO crm_users (
                 user_id, android_id, install_uuid, public_ip, local_ip,
                 location_info, device_model, os_version, network_type,
-                saved_contacts_count, free_contacts_used, free_tier_exhausted,
-                active_code, is_subscribed, last_seen_at
+                saved_contacts_count, free_contacts_used, free_contacts_limit,
+                free_tier_exhausted, plan_type, active_code, is_subscribed, last_seen_at
             )
             VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8, $9,
-                $10::int, $11::int, $12::boolean,
-                $13, $14::boolean, NOW()
+                $10::int, $11::int, $12::int,
+                $13::boolean, $14, $15, $16::boolean, NOW()
             )
             ON CONFLICT (user_id) DO UPDATE SET
                 android_id = EXCLUDED.android_id,
@@ -583,7 +626,13 @@ class PostgresSubscriptionGateway(
                 network_type = EXCLUDED.network_type,
                 saved_contacts_count = GREATEST(crm_users.saved_contacts_count, EXCLUDED.saved_contacts_count),
                 free_contacts_used = GREATEST(crm_users.free_contacts_used, EXCLUDED.free_contacts_used),
+                free_contacts_limit = EXCLUDED.free_contacts_limit,
                 free_tier_exhausted = crm_users.free_tier_exhausted OR EXCLUDED.free_tier_exhausted,
+                plan_type = CASE
+                    WHEN crm_users.is_subscribed OR EXCLUDED.is_subscribed THEN 'SUBSCRIBED'
+                    WHEN crm_users.free_tier_exhausted OR EXCLUDED.free_tier_exhausted THEN 'FREE_EXHAUSTED'
+                    ELSE 'FREE'
+                END,
                 active_code = COALESCE(EXCLUDED.active_code, crm_users.active_code),
                 is_subscribed = crm_users.is_subscribed OR EXCLUDED.is_subscribed,
                 last_seen_at = NOW()
@@ -600,7 +649,9 @@ class PostgresSubscriptionGateway(
                 snapshot.networkType,
                 totalContacts.toString(),
                 freeState.usedContacts.toString(),
+                freeState.limit.toString(),
                 freeState.isExhausted.toString(),
+                planType,
                 activeCode,
                 isSubscribed.toString()
             )

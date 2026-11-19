@@ -145,7 +145,7 @@ class PostgresException(message: String, val sqlState: String? = null) : IOExcep
  */
 class PostgresWireClient(
     private val config: PostgresConnectionConfig,
-    private val timeoutMs: Int = 8_000
+    private val timeoutMs: Int = 5_000
 ) : AutoCloseable {
 
     private var socket: Socket? = null

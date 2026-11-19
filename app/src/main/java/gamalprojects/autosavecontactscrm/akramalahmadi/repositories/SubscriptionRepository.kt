@@ -108,6 +108,13 @@ data class SessionVerifyOutcome(
     val isConnectionError: Boolean
 )
 
+data class LocalAccessDecision(
+    val activeInfo: ActiveSubscriptionInfo?,
+    val freeAccessState: FreeAccessState,
+    val isAllowed: Boolean,
+    val errorMessage: String?
+)
+
 class SubscriptionRepository(
     private val db: AppDatabase,
     private val apiServiceOverride: SubscriptionApiService? = null,
@@ -232,6 +239,60 @@ class SubscriptionRepository(
     }
 
     /**
+     * Instant local Room check (< 10ms, zero network) used so the splash screen
+     * never hangs when the internet or database is unreachable.
+     */
+    suspend fun checkLocalAccessQuick(context: Context): LocalAccessDecision = withContext(Dispatchers.IO) {
+        val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val freeState = getFreeAccessStateSync()
+        val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
+        val explicitlyLocked = settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1"
+        val now = System.currentTimeMillis()
+
+        val cached = activeCodeKey?.takeIf { it.isNotBlank() }?.let { codeDao.getCode(it) }
+        if (cached != null) {
+            if (!cached.isLifetime && cached.expiresAt != null && now >= cached.expiresAt) {
+                val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
+                settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
+                return@withContext LocalAccessDecision(null, freeState, isAllowed = false, errorMessage = msg)
+            }
+            if (cached.maxContacts != null && cached.maxContacts > 0 && cached.usedContacts >= cached.maxContacts) {
+                val msg = "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
+                settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
+                return@withContext LocalAccessDecision(null, freeState, isAllowed = false, errorMessage = msg)
+            }
+            if (cached.isActive && cached.isSubscribed &&
+                (cached.boundUserId.isNullOrBlank() || cached.boundUserId == snapshot.userId)
+            ) {
+                return@withContext LocalAccessDecision(
+                    activeInfo = cached.toActiveInfo(snapshot),
+                    freeAccessState = freeState,
+                    isAllowed = true,
+                    errorMessage = null
+                )
+            }
+        }
+
+        val allowFree = !freeState.isExhausted && !explicitlyLocked
+        val reason = if (allowFree) {
+            null
+        } else {
+            settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
+                ?: if (freeState.isExhausted) MSG_FREE_LIMIT_REACHED else null
+        }
+        LocalAccessDecision(
+            activeInfo = null,
+            freeAccessState = freeState,
+            isAllowed = allowFree,
+            errorMessage = reason
+        )
+    }
+
+    /**
      * Runs on app launch (and on manual connection refresh):
      * 1. Captures user identity & public IP.
      * 2. Connects to PostgreSQL (via DATABASE_URL) and sends/syncs user telemetry immediately.
@@ -300,7 +361,7 @@ class SubscriptionRepository(
                 freeState = freeState,
                 totalContacts = totalContacts,
                 activeCodeKey = activeCodeKey,
-                cachedUsedQuota = cached?.usedContacts ?: 0,
+                cachedCode = cached,
                 explicitlyLocked = explicitlyLocked
             )
             if (outcome.dbStatus is DbConnectionStatus.Connected) {
@@ -317,7 +378,7 @@ class SubscriptionRepository(
                 freeState = freeState,
                 totalContacts = totalContacts,
                 activeCodeKey = activeCodeKey,
-                cachedUsedQuota = cached?.usedContacts ?: 0,
+                cachedCode = cached,
                 explicitlyLocked = explicitlyLocked
             )
             if (outcome.dbStatus is DbConnectionStatus.Connected) {
@@ -380,9 +441,10 @@ class SubscriptionRepository(
         freeState: FreeAccessState,
         totalContacts: Int,
         activeCodeKey: String?,
-        cachedUsedQuota: Int,
+        cachedCode: SubscriptionCodeEntity?,
         explicitlyLocked: Boolean
     ): SessionVerifyOutcome {
+        val cachedUsedQuota = cachedCode?.usedContacts ?: 0
         return try {
             val connectOutcome = gateway.connectAndSyncUser(
                 snapshot = snapshot,
@@ -431,17 +493,7 @@ class SubscriptionRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
-            val offlineStatus = DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
-            val allowFree = activeCodeKey.isNullOrBlank() && !freeState.isExhausted && !explicitlyLocked
-            val reason = if (allowFree) null else MSG_CONTACT_OWNER_OFFLINE
-            SessionVerifyOutcome(
-                activeInfo = null,
-                freeAccessState = freeState,
-                isAllowed = allowFree,
-                dbStatus = offlineStatus,
-                errorMessage = reason,
-                isConnectionError = !allowFree
-            )
+            offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked)
         }
     }
 
@@ -451,9 +503,10 @@ class SubscriptionRepository(
         freeState: FreeAccessState,
         totalContacts: Int,
         activeCodeKey: String?,
-        cachedUsedQuota: Int,
+        cachedCode: SubscriptionCodeEntity?,
         explicitlyLocked: Boolean
     ): SessionVerifyOutcome {
+        val cachedUsedQuota = cachedCode?.usedContacts ?: 0
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
         return try {
             // Send user telemetry on launch even before subscribing
@@ -473,7 +526,9 @@ class SubscriptionRepository(
                         networkType = snapshot.networkType,
                         savedContactsCount = totalContacts,
                         freeContactsUsed = freeState.usedContacts,
+                        freeContactsLimit = freeState.limit,
                         freeTierExhausted = freeState.isExhausted,
+                        planType = if (!activeCodeKey.isNullOrBlank()) "SUBSCRIBED" else if (freeState.isExhausted) "FREE_EXHAUSTED" else "FREE",
                         activeCode = activeCodeKey
                     )
                 )
@@ -553,18 +608,49 @@ class SubscriptionRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
-            val offlineStatus = DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
-            val allowFree = activeCodeKey.isNullOrBlank() && !freeState.isExhausted && !explicitlyLocked
-            val reason = if (allowFree) null else MSG_CONTACT_OWNER_OFFLINE
-            SessionVerifyOutcome(
-                activeInfo = null,
+            offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked)
+        }
+    }
+
+    private fun offlineFallbackOutcome(
+        snapshot: UserNetworkSnapshot,
+        freeState: FreeAccessState,
+        activeCodeKey: String?,
+        cachedCode: SubscriptionCodeEntity?,
+        explicitlyLocked: Boolean
+    ): SessionVerifyOutcome {
+        val offlineStatus = DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
+        val now = System.currentTimeMillis()
+        val validCached = if (!activeCodeKey.isNullOrBlank() && cachedCode != null &&
+            cachedCode.isActive && cachedCode.isSubscribed &&
+            (cachedCode.boundUserId.isNullOrBlank() || cachedCode.boundUserId == snapshot.userId) &&
+            (cachedCode.isLifetime || cachedCode.expiresAt == null || now < cachedCode.expiresAt) &&
+            (cachedCode.maxContacts == null || cachedCode.maxContacts <= 0 || cachedCode.usedContacts < cachedCode.maxContacts)
+        ) {
+            cachedCode
+        } else {
+            null
+        }
+        if (validCached != null) {
+            return SessionVerifyOutcome(
+                activeInfo = validCached.toActiveInfo(snapshot),
                 freeAccessState = freeState,
-                isAllowed = allowFree,
+                isAllowed = true,
                 dbStatus = offlineStatus,
-                errorMessage = reason,
-                isConnectionError = !allowFree
+                errorMessage = null,
+                isConnectionError = false
             )
         }
+        val allowFree = !freeState.isExhausted && !explicitlyLocked
+        val reason = if (allowFree) null else MSG_CONTACT_OWNER_OFFLINE
+        return SessionVerifyOutcome(
+            activeInfo = null,
+            freeAccessState = freeState,
+            isAllowed = allowFree,
+            dbStatus = offlineStatus,
+            errorMessage = reason,
+            isConnectionError = !allowFree
+        )
     }
 
     private suspend fun pingAndSyncUserOnly(
@@ -603,7 +689,9 @@ class SubscriptionRepository(
                         networkType = snapshot.networkType,
                         savedContactsCount = totalContacts,
                         freeContactsUsed = freeState.usedContacts,
+                        freeContactsLimit = freeState.limit,
                         freeTierExhausted = freeState.isExhausted,
+                        planType = if (!activeCode.isNullOrBlank()) "SUBSCRIBED" else if (freeState.isExhausted) "FREE_EXHAUSTED" else "FREE",
                         activeCode = activeCode
                     )
                 )
@@ -817,11 +905,22 @@ class SubscriptionRepository(
             val storedUsed = settingDao.getSetting(KEY_FREE_USED)?.value?.toIntOrNull() ?: 0
             val dbCount = contactDao.getContactsCountSync()
             val nextFreeUsed = maxOf(storedUsed + 1, dbCount)
+            val isExhausted = nextFreeUsed >= FREE_CONTACTS_LIMIT
             settingDao.insertSetting(SettingEntity(KEY_FREE_USED, nextFreeUsed.toString()))
 
-            if (nextFreeUsed >= FREE_CONTACTS_LIMIT) {
+            if (isExhausted) {
                 settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
                 settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, MSG_FREE_LIMIT_REACHED))
+            }
+
+            val updatedFreeState = FreeAccessState(
+                usedContacts = nextFreeUsed,
+                limit = FREE_CONTACTS_LIMIT,
+                isExhausted = isExhausted
+            )
+            syncFreeUsageToBackend(context, updatedFreeState)
+
+            if (isExhausted) {
                 NotificationHelper.showNotification(
                     context,
                     "انتهى الحد المجاني (100 جهة اتصال)",
@@ -860,6 +959,62 @@ class SubscriptionRepository(
         true
     }
 
+    private suspend fun resolveCurrentPlanType(): String {
+        val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
+        if (!activeCodeKey.isNullOrBlank()) {
+            val entity = codeDao.getCode(activeCodeKey)
+            if (entity != null && entity.isActive && entity.isSubscribed) {
+                return "SUBSCRIBED"
+            }
+        }
+        val freeState = getFreeAccessStateSync()
+        return if (freeState.isExhausted) "FREE_EXHAUSTED" else "FREE"
+    }
+
+    private suspend fun syncFreeUsageToBackend(context: Context, freeState: FreeAccessState) {
+        val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val totalContacts = contactDao.getContactsCountSync()
+        val pgGateway = resolvePostgresGateway()
+        if (pgGateway != null) {
+            try {
+                pgGateway.reportFreeUsage(snapshot, totalContacts, freeState)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+            }
+            return
+        }
+
+        val api = resolveApiService() ?: return
+        val (authHeader, apiKeyHeader) = resolveAuthHeaders()
+        try {
+            api.connectAndSyncUser(
+                authorization = authHeader,
+                apiKey = apiKeyHeader,
+                request = SubscriptionConnectRequest(
+                    userId = snapshot.userId,
+                    androidId = snapshot.androidId,
+                    installUuid = snapshot.installUuid,
+                    publicIp = snapshot.publicIp,
+                    localIp = snapshot.localIp,
+                    locationInfo = snapshot.locationInfo,
+                    deviceModel = snapshot.deviceModel,
+                    osVersion = snapshot.osVersion,
+                    networkType = snapshot.networkType,
+                    savedContactsCount = totalContacts,
+                    freeContactsUsed = freeState.usedContacts,
+                    freeContactsLimit = freeState.limit,
+                    freeTierExhausted = freeState.isExhausted,
+                    planType = if (freeState.isExhausted) "FREE_EXHAUSTED" else "FREE",
+                    activeCode = null
+                )
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+        }
+    }
+
     private suspend fun syncUsageToBackend(context: Context, code: String, usedCount: Int) {
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
         val totalContacts = contactDao.getContactsCountSync()
@@ -885,7 +1040,8 @@ class SubscriptionRepository(
                     userId = snapshot.userId,
                     publicIp = snapshot.publicIp,
                     usedContacts = usedCount,
-                    totalContacts = totalContacts
+                    totalContacts = totalContacts,
+                    planType = "SUBSCRIBED"
                 )
             )
         } catch (e: CancellationException) {
@@ -926,11 +1082,12 @@ class SubscriptionRepository(
 
         val item = contact.toClientSyncItem(isDeleted = isDeleted)
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val planType = resolveCurrentPlanType()
 
         val pgGateway = resolvePostgresGateway()
         if (pgGateway != null) {
             return@withContext try {
-                pgGateway.syncClientsBatch(snapshot.userId, listOf(item))
+                pgGateway.syncClientsBatch(snapshot.userId, listOf(item), planType = planType)
                 if (isDeleted) {
                     unmarkPendingClientDeleted(contact.phone)
                 }
@@ -951,6 +1108,7 @@ class SubscriptionRepository(
                 request = ClientSyncBatchRequest(
                     userId = snapshot.userId,
                     publicIp = snapshot.publicIp,
+                    planType = planType,
                     clients = listOf(item)
                 )
             )
@@ -985,9 +1143,10 @@ class SubscriptionRepository(
         if (items.isEmpty()) return@withContext true
 
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val planType = resolveCurrentPlanType()
         if (pgGateway != null) {
             return@withContext try {
-                pgGateway.syncClientsBatch(snapshot.userId, items)
+                pgGateway.syncClientsBatch(snapshot.userId, items, planType = planType)
                 if (pendingDeletes.isNotEmpty()) {
                     savePendingDeletedClients(emptyList())
                 }
@@ -1007,6 +1166,7 @@ class SubscriptionRepository(
                 request = ClientSyncBatchRequest(
                     userId = snapshot.userId,
                     publicIp = snapshot.publicIp,
+                    planType = planType,
                     clients = items
                 )
             )

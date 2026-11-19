@@ -8,6 +8,7 @@ import android.os.Build
 import android.provider.Settings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -39,10 +40,23 @@ object UserIdentityManager {
 
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(5, TimeUnit.SECONDS)
-            .writeTimeout(5, TimeUnit.SECONDS)
+            .connectTimeout(1500, TimeUnit.MILLISECONDS)
+            .readTimeout(1500, TimeUnit.MILLISECONDS)
+            .writeTimeout(1500, TimeUnit.MILLISECONDS)
+            .callTimeout(2000, TimeUnit.MILLISECONDS)
             .build()
+    }
+
+    fun hasInternetConnectivity(context: Context): Boolean {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return true
+            val network = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(network) ?: return false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } catch (_: Exception) {
+            true
+        }
     }
 
     @SuppressLint("HardwareIds")
@@ -169,65 +183,69 @@ object UserIdentityManager {
         var publicIp = ""
         var locationInfo = ""
 
-        // Primary: ipwho.is (returns IP, country, city, ISP)
-        try {
-            val req = Request.Builder().url("https://ipwho.is/").get().build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val body = resp.body?.string().orEmpty()
-                    if (body.isNotBlank()) {
-                        val json = JSONObject(body)
-                        val success = json.optBoolean("success", true)
-                        val ip = json.optString("ip", "")
-                        if (success && ip.isNotBlank()) {
-                            publicIp = ip
-                            val country = json.optString("country", "")
-                            val city = json.optString("city", "")
-                            val isp = json.optJSONObject("connection")?.optString("isp", "").orEmpty()
-                            locationInfo = listOf(city, country, isp)
-                                .filter { it.isNotBlank() }
-                                .joinToString(" • ")
+        if (hasInternetConnectivity(context)) {
+            withTimeoutOrNull(2500L) {
+                // Primary: ipwho.is (returns IP, country, city, ISP)
+                try {
+                    val req = Request.Builder().url("https://ipwho.is/").get().build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val body = resp.body?.string().orEmpty()
+                            if (body.isNotBlank()) {
+                                val json = JSONObject(body)
+                                val success = json.optBoolean("success", true)
+                                val ip = json.optString("ip", "")
+                                if (success && ip.isNotBlank()) {
+                                    publicIp = ip
+                                    val country = json.optString("country", "")
+                                    val city = json.optString("city", "")
+                                    val isp = json.optJSONObject("connection")?.optString("isp", "").orEmpty()
+                                    locationInfo = listOf(city, country, isp)
+                                        .filter { it.isNotBlank() }
+                                        .joinToString(" • ")
+                                }
+                            }
                         }
                     }
+                } catch (_: Exception) {
+                    // Fallback below
                 }
-            }
-        } catch (_: Exception) {
-            // Fallback below
-        }
 
-        // Fallback 1: api.ipify.org
-        if (publicIp.isBlank()) {
-            try {
-                val req = Request.Builder().url("https://api.ipify.org?format=json").get().build()
-                httpClient.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string().orEmpty()
-                        val ip = JSONObject(body).optString("ip", "")
-                        if (ip.isNotBlank()) {
-                            publicIp = ip
+                // Fallback 1: api.ipify.org
+                if (publicIp.isBlank()) {
+                    try {
+                        val req = Request.Builder().url("https://api.ipify.org?format=json").get().build()
+                        httpClient.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val body = resp.body?.string().orEmpty()
+                                val ip = JSONObject(body).optString("ip", "")
+                                if (ip.isNotBlank()) {
+                                    publicIp = ip
+                                }
+                            }
                         }
+                    } catch (_: Exception) {
+                        // Fallback below
                     }
                 }
-            } catch (_: Exception) {
-                // Fallback below
-            }
-        }
 
-        // Fallback 2: api64.ipify.org
-        if (publicIp.isBlank()) {
-            try {
-                val req = Request.Builder().url("https://api64.ipify.org?format=json").get().build()
-                httpClient.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string().orEmpty()
-                        val ip = JSONObject(body).optString("ip", "")
-                        if (ip.isNotBlank()) {
-                            publicIp = ip
+                // Fallback 2: api64.ipify.org
+                if (publicIp.isBlank()) {
+                    try {
+                        val req = Request.Builder().url("https://api64.ipify.org?format=json").get().build()
+                        httpClient.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val body = resp.body?.string().orEmpty()
+                                val ip = JSONObject(body).optString("ip", "")
+                                if (ip.isNotBlank()) {
+                                    publicIp = ip
+                                }
+                            }
                         }
+                    } catch (_: Exception) {
+                        // Offline or blocked
                     }
                 }
-            } catch (_: Exception) {
-                // Offline or blocked
             }
         }
 

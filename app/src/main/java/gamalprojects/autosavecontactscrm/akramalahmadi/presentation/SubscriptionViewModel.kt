@@ -23,11 +23,13 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 class SubscriptionViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -77,6 +79,8 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
 
     private val _nowMillis = MutableStateFlow(System.currentTimeMillis())
     val nowMillis: StateFlow<Long> = _nowMillis.asStateFlow()
+
+    private val _initialSyncCompleted = MutableStateFlow(false)
 
     val isBackendConfigured: Boolean = repo.isDatabaseConfigured()
 
@@ -230,7 +234,12 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                     _isConnectionError.value = false
                     onAutoUnlocked?.invoke()
                 }
+            } catch (_: Throwable) {
+                if (repo.isDatabaseConfigured() && _dbConnectionStatus.value !is DbConnectionStatus.Connected) {
+                    _dbConnectionStatus.value = DbConnectionStatus.Disconnected(SubscriptionRepository.MSG_CONTACT_OWNER_OFFLINE)
+                }
             } finally {
+                _initialSyncCompleted.value = true
                 if (showCheckingState) {
                     _isRefreshingIdentity.value = false
                 }
@@ -247,21 +256,24 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
     fun verifySessionOnLaunch(onResult: (isAllowed: Boolean) -> Unit) {
         viewModelScope.launch {
             _isVerifying.value = true
-            if (_dbConnectionStatus.value !is DbConnectionStatus.Connected) {
-                _dbConnectionStatus.value = DbConnectionStatus.Checking
-            }
             try {
-                val outcome = syncMutex.withLock {
-                    repo.verifyCurrentSession(getApplication())
+                // Initial sync already started in init {}; wait briefly (max 600ms) so Splash never hangs if offline/stalled.
+                if (!_initialSyncCompleted.value) {
+                    withTimeoutOrNull(600L) {
+                        _initialSyncCompleted.first { it }
+                    }
                 }
-                _identitySnapshot.value = UserIdentityManager.getCachedSnapshot(getApplication())
-                _activeSubscription.value = outcome.activeInfo
-                _freeAccessState.value = outcome.freeAccessState
-                _dbConnectionStatus.value = outcome.dbStatus
-                _isExplicitlyLocked.value = !outcome.isAllowed && outcome.activeInfo == null && !outcome.freeAccessState.isExhausted
-                _gateError.value = outcome.errorMessage
-                _isConnectionError.value = outcome.isConnectionError
-                onResult(outcome.isAllowed)
+                val quick = repo.checkLocalAccessQuick(getApplication())
+                _activeSubscription.value = quick.activeInfo
+                _freeAccessState.value = quick.freeAccessState
+                _isExplicitlyLocked.value =
+                    !quick.isAllowed && quick.activeInfo == null && !quick.freeAccessState.isExhausted
+                if (!quick.isAllowed) {
+                    _gateError.value = quick.errorMessage
+                }
+                onResult(quick.isAllowed)
+            } catch (_: Throwable) {
+                onResult(true)
             } finally {
                 _isVerifying.value = false
             }

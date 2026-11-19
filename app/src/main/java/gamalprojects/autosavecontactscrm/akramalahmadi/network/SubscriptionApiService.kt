@@ -27,7 +27,9 @@ data class SubscriptionConnectRequest(
     @Json(name = "network_type") val networkType: String,
     @Json(name = "saved_contacts_count") val savedContactsCount: Int = 0,
     @Json(name = "free_contacts_used") val freeContactsUsed: Int = 0,
+    @Json(name = "free_contacts_limit") val freeContactsLimit: Int = 100,
     @Json(name = "free_tier_exhausted") val freeTierExhausted: Boolean = false,
+    @Json(name = "plan_type") val planType: String = "FREE",
     @Json(name = "active_code") val activeCode: String? = null,
     @Json(name = "app_version") val appVersion: String = "1.0"
 )
@@ -66,7 +68,8 @@ data class SubscriptionUsageRequest(
     @Json(name = "user_id") val userId: String,
     @Json(name = "public_ip") val publicIp: String,
     @Json(name = "used_contacts") val usedContacts: Int,
-    @Json(name = "total_contacts") val totalContacts: Int
+    @Json(name = "total_contacts") val totalContacts: Int,
+    @Json(name = "plan_type") val planType: String = "SUBSCRIBED"
 )
 
 @JsonClass(generateAdapter = true)
@@ -98,6 +101,7 @@ data class ClientSyncItem(
 data class ClientSyncBatchRequest(
     @Json(name = "user_id") val userId: String,
     @Json(name = "public_ip") val publicIp: String,
+    @Json(name = "plan_type") val planType: String = "FREE",
     @Json(name = "clients") val clients: List<ClientSyncItem>
 )
 
@@ -206,9 +210,10 @@ interface SubscriptionApiService {
                     level = HttpLoggingInterceptor.Level.BASIC
                 }
                 val client = OkHttpClient.Builder()
-                    .connectTimeout(8, TimeUnit.SECONDS)
-                    .readTimeout(8, TimeUnit.SECONDS)
-                    .writeTimeout(8, TimeUnit.SECONDS)
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .readTimeout(5, TimeUnit.SECONDS)
+                    .writeTimeout(5, TimeUnit.SECONDS)
+                    .callTimeout(6, TimeUnit.SECONDS)
                     .addInterceptor(logging)
                     .build()
 
