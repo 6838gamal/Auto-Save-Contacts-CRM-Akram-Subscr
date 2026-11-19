@@ -10,7 +10,27 @@ import retrofit2.converter.moshi.MoshiConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.Header
 import retrofit2.http.POST
+import java.net.URI
+import java.net.URLDecoder
 import java.util.concurrent.TimeUnit
+
+@JsonClass(generateAdapter = true)
+data class SubscriptionConnectRequest(
+    @Json(name = "user_id") val userId: String,
+    @Json(name = "android_id") val androidId: String,
+    @Json(name = "install_uuid") val installUuid: String,
+    @Json(name = "public_ip") val publicIp: String,
+    @Json(name = "local_ip") val localIp: String,
+    @Json(name = "location_info") val locationInfo: String,
+    @Json(name = "device_model") val deviceModel: String,
+    @Json(name = "os_version") val osVersion: String,
+    @Json(name = "network_type") val networkType: String,
+    @Json(name = "saved_contacts_count") val savedContactsCount: Int = 0,
+    @Json(name = "free_contacts_used") val freeContactsUsed: Int = 0,
+    @Json(name = "free_tier_exhausted") val freeTierExhausted: Boolean = false,
+    @Json(name = "active_code") val activeCode: String? = null,
+    @Json(name = "app_version") val appVersion: String = "1.0"
+)
 
 @JsonClass(generateAdapter = true)
 data class SubscriptionActivateRequest(
@@ -50,6 +70,18 @@ data class SubscriptionUsageRequest(
 )
 
 @JsonClass(generateAdapter = true)
+data class SubscriptionReviewRequest(
+    @Json(name = "user_id") val userId: String,
+    @Json(name = "requested_code") val requestedCode: String = "",
+    @Json(name = "public_ip") val publicIp: String,
+    @Json(name = "local_ip") val localIp: String,
+    @Json(name = "device_model") val deviceModel: String,
+    @Json(name = "location_info") val locationInfo: String,
+    @Json(name = "saved_contacts_count") val savedContactsCount: Int = 0,
+    @Json(name = "notes") val notes: String = ""
+)
+
+@JsonClass(generateAdapter = true)
 data class SubscriptionApiResponse(
     @Json(name = "valid") val valid: Boolean = false,
     @Json(name = "is_subscribed") val isSubscribed: Boolean = true,
@@ -70,6 +102,13 @@ data class SubscriptionApiResponse(
 )
 
 interface SubscriptionApiService {
+
+    @POST("api/subscription/connect")
+    suspend fun connectAndSyncUser(
+        @Header("Authorization") authorization: String?,
+        @Header("X-API-Key") apiKey: String?,
+        @Body request: SubscriptionConnectRequest
+    ): Response<SubscriptionApiResponse>
 
     @POST("api/subscription/activate")
     suspend fun activateCode(
@@ -92,16 +131,48 @@ interface SubscriptionApiService {
         @Body request: SubscriptionUsageRequest
     ): Response<SubscriptionApiResponse>
 
+    @POST("api/subscription/review-request")
+    suspend fun submitReviewRequest(
+        @Header("Authorization") authorization: String?,
+        @Header("X-API-Key") apiKey: String?,
+        @Body request: SubscriptionReviewRequest
+    ): Response<SubscriptionApiResponse>
+
     companion object {
-        fun create(baseUrl: String): SubscriptionApiService? {
-            val normalized = baseUrl.trim().let {
-                if (it.isNotBlank() && !it.endsWith("/")) "$it/" else it
+        fun extractApiKey(databaseUrl: String): String? {
+            return try {
+                val uri = URI(databaseUrl.trim())
+                val query = uri.rawQuery ?: return null
+                for (pair in query.split('&')) {
+                    val idx = pair.indexOf('=')
+                    if (idx > 0) {
+                        val k = URLDecoder.decode(pair.substring(0, idx), "UTF-8")
+                        if (k.equals("api_key", ignoreCase = true) || k.equals("apikey", ignoreCase = true) || k.equals("token", ignoreCase = true)) {
+                            return URLDecoder.decode(pair.substring(idx + 1), "UTF-8").takeIf { it.isNotBlank() }
+                        }
+                    }
+                }
+                null
+            } catch (_: Exception) {
+                null
             }
-            if (!normalized.startsWith("http://") && !normalized.startsWith("https://")) {
+        }
+
+        fun create(databaseUrl: String): SubscriptionApiService? {
+            val trimmed = databaseUrl.trim()
+            if (trimmed.isBlank() ||
+                trimmed == "MY_POSTGRES_DATABASE_URL" ||
+                trimmed.contains("api.example.com", ignoreCase = true)
+            ) {
                 return null
             }
-            if (normalized.contains("api.example.com", ignoreCase = true)) {
+            if (!trimmed.startsWith("http://", ignoreCase = true) &&
+                !trimmed.startsWith("https://", ignoreCase = true)
+            ) {
                 return null
+            }
+            val cleanBase = trimmed.substringBefore('?').let {
+                if (it.endsWith("/")) it else "$it/"
             }
             return try {
                 val logging = HttpLoggingInterceptor().apply {
@@ -115,7 +186,7 @@ interface SubscriptionApiService {
                     .build()
 
                 Retrofit.Builder()
-                    .baseUrl(normalized)
+                    .baseUrl(cleanBase)
                     .client(client)
                     .addConverterFactory(MoshiConverterFactory.create())
                     .build()

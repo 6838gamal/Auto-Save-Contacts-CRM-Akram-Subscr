@@ -61,7 +61,7 @@ fun AutoSaveCrmApp(
     // Force Arab Arabic RTL LayoutDirection
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         val darkTheme by viewModel.isDarkMode.collectAsStateWithLifecycle()
-        val activeSubscription by subscriptionViewModel.activeSubscription.collectAsStateWithLifecycle()
+        val hasAppAccess by subscriptionViewModel.hasAppAccess.collectAsStateWithLifecycle()
 
         MaterialTheme(
             colorScheme = if (darkTheme) {
@@ -90,11 +90,11 @@ fun AutoSaveCrmApp(
             content = {
                 val currentScreen by viewModel.currentScreen.collectAsStateWithLifecycle()
 
-                // Auto-lock if subscription expires or is revoked while using the app
-                LaunchedEffect(activeSubscription, currentScreen) {
+                // Auto-lock immediately if 100 free contacts are reached or subscription expires/is revoked
+                LaunchedEffect(hasAppAccess, currentScreen) {
                     if (currentScreen != Screen.SPLASH &&
                         currentScreen != Screen.SUBSCRIPTION_GATE &&
-                        activeSubscription == null
+                        !hasAppAccess
                     ) {
                         viewModel.stopMonitoring()
                         viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
@@ -118,6 +118,12 @@ fun AutoSaveCrmApp(
                     Screen.SUBSCRIPTION_GATE -> {
                         SubscriptionGateScreen(
                             subscriptionViewModel = subscriptionViewModel,
+                            canNavigateBack = hasAppAccess,
+                            onNavigateBack = {
+                                if (hasAppAccess) {
+                                    viewModel.navigateTo(Screen.DASHBOARD)
+                                }
+                            },
                             onUnlocked = {
                                 viewModel.navigateTo(Screen.DASHBOARD)
                                 viewModel.tryStartMonitoringAutomatically()
@@ -207,7 +213,7 @@ fun SplashScreen(onFinished: () -> Unit) {
             Spacer(modifier = Modifier.height(16.dp))
             
             Text(
-                text = "مظلة أمان لقائمة عملائك...",
+                text = "جاري تهيئة التطبيق والتحقق من الاتصال...",
                 fontSize = 11.sp,
                 color = Color(0xFF64748B)
             )
@@ -335,6 +341,16 @@ fun AppNavigationDrawer(
                     }
                 )
 
+                DrawerMenuItem(
+                    label = "مباشرة التفعيل والاشتراك",
+                    icon = Icons.Filled.VerifiedUser,
+                    isSelected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
+                    }
+                )
+
                 Spacer(modifier = Modifier.weight(1f))
 
                 // Footer section
@@ -388,6 +404,16 @@ fun AppNavigationDrawer(
                         }
                     },
                     actions = {
+                        IconButton(
+                            onClick = { viewModel.navigateTo(Screen.SUBSCRIPTION_GATE) },
+                            modifier = Modifier.testTag("topbar_activate_subscription_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.VpnKey,
+                                contentDescription = "مباشرة التفعيل والاشتراك",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
                         IconButton(onClick = { viewModel.toggleTheme() }) {
                             Icon(
                                 imageVector = if (viewModel.isDarkMode.value) Icons.Filled.LightMode else Icons.Filled.DarkMode,
@@ -459,6 +485,9 @@ fun DashboardScreen(
     val latestContact by viewModel.latestContact.collectAsStateWithLifecycle()
     val isRunning by viewModel.isServiceRunning.collectAsStateWithLifecycle()
     val activeSubscription by subscriptionViewModel.activeSubscription.collectAsStateWithLifecycle()
+    val freeAccessState by subscriptionViewModel.freeAccessState.collectAsStateWithLifecycle()
+    val dbStatus by subscriptionViewModel.dbConnectionStatus.collectAsStateWithLifecycle()
+    val isRefreshingDb by subscriptionViewModel.isRefreshingIdentity.collectAsStateWithLifecycle()
     val nowMillis by subscriptionViewModel.nowMillis.collectAsStateWithLifecycle()
 
     val permGranted by viewModel.permissionsGranted.collectAsStateWithLifecycle()
@@ -477,16 +506,38 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         item {
-            SubscriptionStatusCard(
-                info = activeSubscription,
-                nowMillis = nowMillis,
-                onSwitchCode = {
-                    subscriptionViewModel.lockAndSwitchCode {
-                        viewModel.stopMonitoring()
+            if (activeSubscription != null) {
+                SubscriptionStatusCard(
+                    info = activeSubscription,
+                    nowMillis = nowMillis,
+                    onSwitchCode = {
+                        subscriptionViewModel.lockAndSwitchCode {
+                            viewModel.stopMonitoring()
+                            viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
+                        }
+                    }
+                )
+            } else {
+                FreeUsageStatusCard(
+                    freeState = freeAccessState,
+                    onActivateCodeClick = {
                         viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
                     }
-                }
-            )
+                )
+            }
+        }
+        if (dbStatus !is gamalprojects.autosavecontactscrm.akramalahmadi.repositories.DbConnectionStatus.Checking) {
+            item {
+                PostgresConnectionBadgeCard(
+                    dbStatus = dbStatus,
+                    isBusy = isRefreshingDb,
+                    onRetrySync = {
+                        subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
+                            Toast.makeText(context, "تم تفعيل اشتراكك عبر PostgreSQL!", Toast.LENGTH_SHORT).show()
+                        })
+                    }
+                )
+            }
         }
         // Monitoring status card
         item {
@@ -1325,6 +1376,9 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
     val activeSubscription by subscriptionViewModel.activeSubscription.collectAsStateWithLifecycle()
+    val freeAccessState by subscriptionViewModel.freeAccessState.collectAsStateWithLifecycle()
+    val dbStatus by subscriptionViewModel.dbConnectionStatus.collectAsStateWithLifecycle()
+    val isRefreshingDb by subscriptionViewModel.isRefreshingIdentity.collectAsStateWithLifecycle()
     val nowMillis by subscriptionViewModel.nowMillis.collectAsStateWithLifecycle()
 
     LazyColumn(
@@ -1333,18 +1387,40 @@ fun SettingsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Subscription Status Card
+        // Subscription / Free Tier Status Card
         item {
-            SubscriptionStatusCard(
-                info = activeSubscription,
-                nowMillis = nowMillis,
-                onSwitchCode = {
-                    subscriptionViewModel.lockAndSwitchCode {
-                        viewModel.stopMonitoring()
+            if (activeSubscription != null) {
+                SubscriptionStatusCard(
+                    info = activeSubscription,
+                    nowMillis = nowMillis,
+                    onSwitchCode = {
+                        subscriptionViewModel.lockAndSwitchCode {
+                            viewModel.stopMonitoring()
+                            viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
+                        }
+                    }
+                )
+            } else {
+                FreeUsageStatusCard(
+                    freeState = freeAccessState,
+                    onActivateCodeClick = {
                         viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
                     }
-                }
-            )
+                )
+            }
+        }
+        if (dbStatus !is gamalprojects.autosavecontactscrm.akramalahmadi.repositories.DbConnectionStatus.Checking) {
+            item {
+                PostgresConnectionBadgeCard(
+                    dbStatus = dbStatus,
+                    isBusy = isRefreshingDb,
+                    onRetrySync = {
+                        subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
+                            Toast.makeText(context, "تم تفعيل اشتراكك عبر PostgreSQL!", Toast.LENGTH_SHORT).show()
+                        })
+                    }
+                )
+            }
         }
         // App Style Settings
         item {

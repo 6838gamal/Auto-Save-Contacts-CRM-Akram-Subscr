@@ -5,12 +5,18 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityManager
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresConnectionConfig
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSslMode
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionActivateRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiResponse
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiService
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionConnectRequest
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionReviewRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionUsageRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionVerifyRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ActivationResult
+import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.DbConnectionStatus
+import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ReviewRequestResult
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.SubscriptionRepository
 import kotlinx.coroutines.test.runTest
 import okhttp3.MediaType.Companion.toMediaType
@@ -50,8 +56,33 @@ class SubscriptionManagerTest {
     }
 
     @Test
+    fun `DATABASE_URL parser handles standard postgresql URI and ignores placeholder`() {
+        assertNull(PostgresConnectionConfig.parse("MY_POSTGRES_DATABASE_URL"))
+        assertNull(PostgresConnectionConfig.parse("https://api.example.com/"))
+
+        val parsed = PostgresConnectionConfig.parse(
+            "postgresql://crm_admin:my%40pass%2B1@db.neon.tech:5432/autosave_crm?sslmode=require"
+        )
+        assertNotNull(parsed)
+        assertEquals("crm_admin", parsed!!.username)
+        assertEquals("my@pass+1", parsed.password)
+        assertEquals("db.neon.tech", parsed.host)
+        assertEquals(5432, parsed.port)
+        assertEquals("autosave_crm", parsed.database)
+        assertEquals(PostgresSslMode.REQUIRE, parsed.sslMode)
+    }
+
+    @Test
     fun `offline or unconfigured postgres backend does not crash and prompts to contact owner`() = runTest {
         val offlineApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                throw IOException("Connection refused - PostgreSQL backend offline")
+            }
+
             override suspend fun activateCode(
                 authorization: String?,
                 apiKey: String?,
@@ -75,6 +106,14 @@ class SubscriptionManagerTest {
             ): Response<SubscriptionApiResponse> {
                 throw IOException("Connection refused")
             }
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> {
+                throw IOException("Connection refused")
+            }
         }
 
         val repo = SubscriptionRepository(db, apiServiceOverride = offlineApi)
@@ -82,12 +121,103 @@ class SubscriptionManagerTest {
         assertTrue(result is ActivationResult.Failure)
         val failure = result as ActivationResult.Failure
         assertTrue(failure.isConnectionError)
-        assertTrue(failure.reason.contains("التواصل مع صاحب المشروع"))
+        assertTrue(failure.reason.contains("التواصل مع الإدارة"))
+        assertFalse(failure.reason.contains("DATABASE_URL"))
+
+        // App continues working when DB is offline (under 100 contacts)
+        val verifyWhenOffline = repo.verifyCurrentSession(context)
+        assertTrue(verifyWhenOffline.isAllowed)
+        assertTrue(verifyWhenOffline.dbStatus is DbConnectionStatus.Disconnected)
+
+        // Review request when offline also never crashes
+        val reviewRes = repo.submitReviewRequest(context, "ANY-CODE")
+        assertTrue(reviewRes is ReviewRequestResult.Failure)
+        assertTrue((reviewRes as ReviewRequestResult.Failure).isConnectionError)
+    }
+
+    @Test
+    fun `on app launch verifies postgres connection and sends user identity data`() = runTest {
+        var receivedConnect: SubscriptionConnectRequest? = null
+        var receivedReview: SubscriptionReviewRequest? = null
+
+        val liveApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                receivedConnect = request
+                return Response.success(
+                    SubscriptionApiResponse(valid = true, isSubscribed = false, isActive = true, status = "connected")
+                )
+            }
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = false, isSubscribed = false, isActive = false))
+            }
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = false))
+            }
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = true))
+            }
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> {
+                receivedReview = request
+                return Response.success(
+                    SubscriptionApiResponse(
+                        valid = true,
+                        status = "pending_review",
+                        message = "تم إرسال طلب المراجعة بنجاح"
+                    )
+                )
+            }
+        }
+
+        val repo = SubscriptionRepository(db, apiServiceOverride = liveApi)
+        val outcome = repo.verifyCurrentSession(context)
+
+        assertTrue(outcome.isAllowed)
+        assertTrue(outcome.dbStatus is DbConnectionStatus.Connected)
+        assertNotNull(receivedConnect)
+        assertEquals(UserIdentityManager.getStableUserId(context), receivedConnect!!.userId)
+        assertTrue(receivedConnect!!.publicIp.isNotBlank())
+
+        val reviewOutcome = repo.submitReviewRequest(context, "REQ-999")
+        assertTrue(reviewOutcome is ReviewRequestResult.Success)
+        assertNotNull(receivedReview)
+        assertEquals("REQ-999", receivedReview!!.requestedCode)
     }
 
     @Test
     fun `unsubscribed or inactive status from postgres API keeps user locked`() = runTest {
         val inactiveApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = false, isSubscribed = false, isActive = false))
+            }
+
             override suspend fun activateCode(
                 authorization: String?,
                 apiKey: String?,
@@ -120,6 +250,14 @@ class SubscriptionManagerTest {
             ): Response<SubscriptionApiResponse> {
                 return Response.success(SubscriptionApiResponse(valid = false))
             }
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = true))
+            }
         }
 
         val repo = SubscriptionRepository(db, apiServiceOverride = inactiveApi)
@@ -131,6 +269,14 @@ class SubscriptionManagerTest {
     @Test
     fun `invalid or duplicate code rejected by postgres backend keeps user locked`() = runTest {
         val rejectingApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = false, isSubscribed = false, isActive = true))
+            }
+
             override suspend fun activateCode(
                 authorization: String?,
                 apiKey: String?,
@@ -155,6 +301,14 @@ class SubscriptionManagerTest {
             ): Response<SubscriptionApiResponse> {
                 return Response.success(SubscriptionApiResponse(valid = false))
             }
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = true))
+            }
         }
 
         val repo = SubscriptionRepository(db, apiServiceOverride = rejectingApi)
@@ -174,6 +328,14 @@ class SubscriptionManagerTest {
         val futureExpiry = System.currentTimeMillis() + 30L * 24L * 60L * 60L * 1000L
 
         val workingApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = true, isSubscribed = true, isActive = true))
+            }
+
             override suspend fun activateCode(
                 authorization: String?,
                 apiKey: String?,
@@ -229,6 +391,14 @@ class SubscriptionManagerTest {
             ): Response<SubscriptionApiResponse> {
                 return Response.success(SubscriptionApiResponse(valid = true, isSubscribed = true, isActive = true))
             }
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> {
+                return Response.success(SubscriptionApiResponse(valid = true))
+            }
         }
 
         val repo = SubscriptionRepository(db, apiServiceOverride = workingApi)
@@ -273,5 +443,47 @@ class SubscriptionManagerTest {
         // Re-entering TRIAL-2026 must be rejected
         val retry = repo.activateSubscriptionCode(context, "TRIAL-2026")
         assertTrue(retry is ActivationResult.Failure)
+    }
+
+    @Test
+    fun `free access allows up to 100 saved contacts then locks until valid code entered`() = runTest {
+        val repo = SubscriptionRepository(db, apiServiceOverride = null)
+
+        // Fresh install: user is allowed directly into the app without code
+        val initialVerify = repo.verifyCurrentSession(context)
+        assertTrue(initialVerify.isAllowed)
+        assertNull(initialVerify.activeInfo)
+        assertFalse(initialVerify.freeAccessState.isExhausted)
+        assertEquals(0, initialVerify.freeAccessState.usedContacts)
+
+        // Save 99 contacts -> still allowed
+        repeat(99) {
+            assertTrue(repo.canSaveNewContact())
+            assertTrue(repo.recordContactSaved(context))
+        }
+        assertTrue(repo.canSaveNewContact())
+        assertTrue(repo.verifyCurrentSession(context).isAllowed)
+
+        // 100th saved contact -> immediately exhausts free limit and locks access
+        assertFalse(repo.recordContactSaved(context))
+        assertFalse(repo.canSaveNewContact())
+
+        val lockedVerify = repo.verifyCurrentSession(context)
+        assertFalse(lockedVerify.isAllowed)
+        assertTrue(lockedVerify.freeAccessState.isExhausted)
+        assertEquals(100, lockedVerify.freeAccessState.usedContacts)
+        assertTrue(lockedVerify.errorMessage.orEmpty().contains("+967 772 920 748"))
+
+        // Wrong code does not unlock
+        val badCode = repo.activateSubscriptionCode(context, "WRONG-CODE")
+        assertTrue(badCode is ActivationResult.Failure)
+        assertFalse(repo.verifyCurrentSession(context).isAllowed)
+
+        // Valid code unlocks access
+        val validCode = repo.activateSubscriptionCode(context, "TRIAL-2026")
+        assertTrue(validCode is ActivationResult.Success)
+        val unlockedVerify = repo.verifyCurrentSession(context)
+        assertTrue(unlockedVerify.isAllowed)
+        assertNotNull(unlockedVerify.activeInfo)
     }
 }
