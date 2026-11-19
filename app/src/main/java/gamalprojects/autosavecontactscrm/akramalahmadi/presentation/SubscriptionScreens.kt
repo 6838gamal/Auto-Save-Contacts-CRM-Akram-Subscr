@@ -78,7 +78,6 @@ fun SubscriptionGateScreen(
     val gateError by subscriptionViewModel.gateError.collectAsStateWithLifecycle()
     val reviewNotice by subscriptionViewModel.reviewNotice.collectAsStateWithLifecycle()
     val isConnectionError by subscriptionViewModel.isConnectionError.collectAsStateWithLifecycle()
-    val isDemoTrialExhausted by subscriptionViewModel.isDemoTrialExhausted.collectAsStateWithLifecycle()
     val freeAccessState by subscriptionViewModel.freeAccessState.collectAsStateWithLifecycle()
     val dbStatus by subscriptionViewModel.dbConnectionStatus.collectAsStateWithLifecycle()
 
@@ -332,7 +331,7 @@ fun SubscriptionGateScreen(
                 isBusy = isRefreshing || isVerifying,
                 onRetrySync = {
                     subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
-                        Toast.makeText(context, "تم تفعيل اشتراكك من قاعدة البيانات!", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         onUnlocked()
                     })
                 }
@@ -479,60 +478,6 @@ fun SubscriptionGateScreen(
                         }
                     }
 
-                    if (!subscriptionViewModel.isBackendConfigured) {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        if (isDemoTrialExhausted) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(Color(0xFFF59E0B).copy(alpha = 0.14f))
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.LockClock,
-                                    contentDescription = null,
-                                    tint = Color(0xFFF59E0B),
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "تم استنفاد الكود التجريبي (200/200 جهة اتصال) — يرجى إدخال كود مدفوع.",
-                                    fontSize = 11.sp,
-                                    color = Color(0xFFF59E0B),
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                        } else {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.1f))
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "كود تجريبي افتراضي (7 أيام / 200 رقم): TRIAL-2026",
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.secondary,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                TextButton(
-                                    onClick = {
-                                        codeInput = "TRIAL-2026"
-                                        subscriptionViewModel.clearGateError()
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
-                                ) {
-                                    Text("تعبئة", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                        }
-                    }
-
                     Spacer(modifier = Modifier.height(16.dp))
 
                     Button(
@@ -551,7 +496,7 @@ fun SubscriptionGateScreen(
                                 modifier = Modifier.size(22.dp)
                             )
                             Spacer(modifier = Modifier.width(10.dp))
-                            Text("جاري التحقق من PostgreSQL...", fontWeight = FontWeight.Bold)
+                            Text("جاري التحقق...", fontWeight = FontWeight.Bold)
                         } else {
                             Icon(Icons.Filled.LockOpen, contentDescription = null)
                             Spacer(modifier = Modifier.width(8.dp))
@@ -585,7 +530,7 @@ fun SubscriptionGateScreen(
                             Icon(Icons.Filled.RateReview, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "طلب مراجعة وتفعيل عبر قاعدة البيانات",
+                                text = "طلب مراجعة وتفعيل الاشتراك",
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold
                             )
@@ -868,61 +813,62 @@ fun PostgresConnectionBadgeCard(
 ) {
     val (bgColor, accentColor, icon, title, subtitle) = when (dbStatus) {
         is DbConnectionStatus.Checking -> Tuple5(
-            MaterialTheme.colorScheme.secondary.copy(alpha = 0.1f),
+            MaterialTheme.colorScheme.secondary.copy(alpha = 0.08f),
             MaterialTheme.colorScheme.secondary,
             Icons.Filled.Sync,
-            "جاري التحقق من اتصال PostgreSQL...",
-            "يتم الآن إرسال بيانات التحقق والتأكد من حالة الاشتراك"
+            "حالة الاتصال: جاري التحقق...",
+            null
         )
         is DbConnectionStatus.Connected -> Tuple5(
-            Color(0xFF10B981).copy(alpha = 0.12f),
+            Color(0xFF10B981).copy(alpha = 0.10f),
             Color(0xFF10B981),
             Icons.Filled.CloudDone,
-            "متصل بقاعدة بيانات PostgreSQL",
-            dbStatus.message
+            "حالة الاتصال: متصل",
+            null
         )
-        is DbConnectionStatus.Disconnected -> Tuple5(
-            Color(0xFFF59E0B).copy(alpha = 0.14f),
-            Color(0xFFF59E0B),
-            Icons.Filled.CloudOff,
-            "قاعدة البيانات غير متصلة حالياً",
-            dbStatus.reason
-        )
+        is DbConnectionStatus.Disconnected,
         is DbConnectionStatus.NotConfigured -> Tuple5(
             Color(0xFFF59E0B).copy(alpha = 0.12f),
             Color(0xFFF59E0B),
-            Icons.Filled.SupportAgent,
-            "تواصل مع الإدارة لمراجعة الأمر",
-            dbStatus.message
+            Icons.Filled.CloudOff,
+            "حالة الاتصال: غير متصل",
+            "تواصل مع الإدارة لمراجعة الأمر (${SubscriptionRepository.ADMIN_PHONE_DISPLAY})"
         )
     }
 
     Card(
         colors = CardDefaults.cardColors(containerColor = bgColor),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, accentColor.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
+            .border(1.dp, accentColor.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
             .testTag("postgres_connection_status_card")
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
+                .padding(horizontal = 14.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (dbStatus is DbConnectionStatus.Checking || isBusy) {
                 CircularProgressIndicator(
                     strokeWidth = 2.dp,
                     color = accentColor,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(16.dp)
                 )
             } else {
+                Box(
+                    modifier = Modifier
+                        .size(9.dp)
+                        .clip(CircleShape)
+                        .background(accentColor)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
                 Icon(
                     imageVector = icon,
                     contentDescription = title,
                     tint = accentColor,
-                    modifier = Modifier.size(22.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
             Spacer(modifier = Modifier.width(10.dp))
@@ -933,25 +879,27 @@ fun PostgresConnectionBadgeCard(
                     fontWeight = FontWeight.Bold,
                     color = accentColor
                 )
-                Text(
-                    text = subtitle,
-                    fontSize = 10.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f),
-                    lineHeight = 14.sp
-                )
+                if (!subtitle.isNullOrBlank()) {
+                    Text(
+                        text = subtitle,
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f),
+                        lineHeight = 14.sp
+                    )
+                }
             }
             IconButton(
                 onClick = onRetrySync,
                 enabled = !isBusy,
                 modifier = Modifier
-                    .size(40.dp)
+                    .size(36.dp)
                     .testTag("retry_postgres_sync_button")
             ) {
                 Icon(
                     imageVector = Icons.Filled.Refresh,
-                    contentDescription = "تحديث الاتصال وإرسال البيانات",
+                    contentDescription = "تحديث الاتصال",
                     tint = accentColor,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
         }
@@ -1203,7 +1151,7 @@ fun SubscriptionStatusCard(
             ) {
                 Text(text = "حالة التفعيل:", fontSize = 12.sp, color = Color.Gray)
                 Text(
-                    text = if (info.isTrial) "تجريبي مفعل" else "مدفوع مفعل",
+                    text = "اشتراك مفعل",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary

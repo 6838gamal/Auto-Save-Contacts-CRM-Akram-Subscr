@@ -82,6 +82,26 @@ data class SubscriptionReviewRequest(
 )
 
 @JsonClass(generateAdapter = true)
+data class ClientSyncItem(
+    @Json(name = "phone") val phone: String,
+    @Json(name = "original_phone") val originalPhone: String,
+    @Json(name = "name") val name: String,
+    @Json(name = "source") val source: String,
+    @Json(name = "created_at") val createdAt: Long,
+    @Json(name = "last_activity") val lastActivity: Long,
+    @Json(name = "interaction_count") val interactionCount: Int,
+    @Json(name = "is_synced_to_phone") val isSyncedToPhone: Boolean,
+    @Json(name = "is_deleted") val isDeleted: Boolean = false
+)
+
+@JsonClass(generateAdapter = true)
+data class ClientSyncBatchRequest(
+    @Json(name = "user_id") val userId: String,
+    @Json(name = "public_ip") val publicIp: String,
+    @Json(name = "clients") val clients: List<ClientSyncItem>
+)
+
+@JsonClass(generateAdapter = true)
 data class SubscriptionApiResponse(
     @Json(name = "valid") val valid: Boolean = false,
     @Json(name = "is_subscribed") val isSubscribed: Boolean = true,
@@ -136,6 +156,13 @@ interface SubscriptionApiService {
         @Header("Authorization") authorization: String?,
         @Header("X-API-Key") apiKey: String?,
         @Body request: SubscriptionReviewRequest
+    ): Response<SubscriptionApiResponse>
+
+    @POST("api/clients/sync")
+    suspend fun syncClients(
+        @Header("Authorization") authorization: String?,
+        @Header("X-API-Key") apiKey: String?,
+        @Body request: ClientSyncBatchRequest
     ): Response<SubscriptionApiResponse>
 
     companion object {

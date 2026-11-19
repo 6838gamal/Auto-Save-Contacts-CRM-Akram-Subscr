@@ -180,7 +180,7 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteContact(contact: Contact) {
         viewModelScope.launch {
-            repo.deleteContact(contact)
+            repo.deleteContact(getApplication(), contact)
         }
     }
 
@@ -253,6 +253,7 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     )
                     count++
+                    subscriptionRepo.syncSingleClientToDatabase(getApplication(), newContact, isDeleted = false)
                     val canContinue = subscriptionRepo.recordContactSaved(getApplication())
                     if (!canContinue) break
                 }
@@ -263,6 +264,7 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
 
     fun exportToGoogleContacts(onResult: (Int) -> Unit) {
         viewModelScope.launch {
+            val subscriptionRepo = gamalprojects.autosavecontactscrm.akramalahmadi.repositories.SubscriptionRepository(db)
             val account = _gmailAccount.value
             if (account.isBlank()) {
                 onResult(-1)
@@ -279,7 +281,9 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
                         account
                     )
                     if (success) {
-                        db.contactDao().insertContact(contact.copy(isSyncedToPhone = true))
+                        val updatedContact = contact.copy(isSyncedToPhone = true)
+                        db.contactDao().insertContact(updatedContact)
+                        subscriptionRepo.syncSingleClientToDatabase(getApplication(), updatedContact, isDeleted = false)
                         db.logEntryDao().insertLog(
                             LogEntry(
                                 phone = contact.originalPhone,

@@ -1,6 +1,11 @@
 package gamalprojects.autosavecontactscrm.akramalahmadi.presentation
 
 import android.app.Application
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
@@ -21,11 +26,14 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class SubscriptionViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = AppDatabase.getDatabase(application)
     private val repo = SubscriptionRepository(db)
+    private val syncMutex = Mutex()
 
     private val _identitySnapshot = MutableStateFlow(UserIdentityManager.getCachedSnapshot(application))
     val identitySnapshot: StateFlow<UserNetworkSnapshot> = _identitySnapshot.asStateFlow()
@@ -67,19 +75,21 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
         active != null || (!free.isExhausted && !locked)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, true)
 
-    private val _isDemoTrialExhausted = MutableStateFlow(false)
-    val isDemoTrialExhausted: StateFlow<Boolean> = _isDemoTrialExhausted.asStateFlow()
-
     private val _nowMillis = MutableStateFlow(System.currentTimeMillis())
     val nowMillis: StateFlow<Long> = _nowMillis.asStateFlow()
 
     val isBackendConfigured: Boolean = repo.isDatabaseConfigured()
 
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
     init {
         refreshIdentity()
-        refreshTrialState()
+        // Immediately verify PostgreSQL connection and send telemetry + client sync on app open
+        syncConnectionAndUserData()
+        registerNetworkReconnectCallback()
 
-        // Reactively observe free tier counter (0..100 contacts)
+        // Reactively observe free tier counter (0..100 contacts strictly)
         viewModelScope.launch {
             repo.observeFreeAccessState().collect { state ->
                 _freeAccessState.value = state
@@ -98,7 +108,6 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
             repo.observeActiveSubscription().collect { liveInfo ->
                 if (_activeSubscription.value != null && liveInfo == null) {
                     _activeSubscription.value = null
-                    refreshTrialState()
                 } else if (liveInfo != null) {
                     _activeSubscription.value = liveInfo
                 }
@@ -110,7 +119,16 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                 if (!reason.isNullOrBlank()) {
                     _gateError.value = reason
                     _isConnectionError.value = false
-                    refreshTrialState()
+                }
+            }
+        }
+
+        // Background reconnect loop: keeps retrying until PostgreSQL connection is verified
+        viewModelScope.launch {
+            while (isActive) {
+                delay(10_000L)
+                if (repo.isDatabaseConfigured() && _dbConnectionStatus.value !is DbConnectionStatus.Connected) {
+                    performConnectionAndClientSync(showCheckingState = false)
                 }
             }
         }
@@ -134,9 +152,42 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    private fun refreshTrialState() {
-        viewModelScope.launch {
-            _isDemoTrialExhausted.value = repo.isDemoTrialExhausted()
+    private fun registerNetworkReconnectCallback() {
+        try {
+            val cm = getApplication<Application>().getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (repo.isDatabaseConfigured()) {
+                        viewModelScope.launch {
+                            if (_dbConnectionStatus.value !is DbConnectionStatus.Connected) {
+                                performConnectionAndClientSync(showCheckingState = false)
+                            } else {
+                                repo.syncAllClientsToDatabase(getApplication())
+                            }
+                        }
+                    }
+                }
+            }
+            cm.registerNetworkCallback(request, callback)
+            connectivityManager = cm
+            networkCallback = callback
+        } catch (_: Throwable) {
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        try {
+            val cm = connectivityManager
+            val cb = networkCallback
+            if (cm != null && cb != null) {
+                cm.unregisterNetworkCallback(cb)
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -153,22 +204,36 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
 
     fun syncConnectionAndUserData(onAutoUnlocked: (() -> Unit)? = null) {
         viewModelScope.launch {
-            _isRefreshingIdentity.value = true
-            _dbConnectionStatus.value = DbConnectionStatus.Checking
+            performConnectionAndClientSync(showCheckingState = true, onAutoUnlocked = onAutoUnlocked)
+        }
+    }
+
+    private suspend fun performConnectionAndClientSync(
+        showCheckingState: Boolean,
+        onAutoUnlocked: (() -> Unit)? = null
+    ) {
+        syncMutex.withLock {
+            if (showCheckingState) {
+                _isRefreshingIdentity.value = true
+                _dbConnectionStatus.value = DbConnectionStatus.Checking
+            }
             try {
                 val outcome = repo.verifyCurrentSession(getApplication())
                 _identitySnapshot.value = UserIdentityManager.getCachedSnapshot(getApplication())
                 _activeSubscription.value = outcome.activeInfo
                 _freeAccessState.value = outcome.freeAccessState
                 _dbConnectionStatus.value = outcome.dbStatus
-                _isExplicitlyLocked.value = !outcome.isAllowed && outcome.activeInfo == null && !outcome.freeAccessState.isExhausted
+                _isExplicitlyLocked.value =
+                    !outcome.isAllowed && outcome.activeInfo == null && !outcome.freeAccessState.isExhausted
                 if (outcome.activeInfo != null) {
                     _gateError.value = null
                     _isConnectionError.value = false
                     onAutoUnlocked?.invoke()
                 }
             } finally {
-                _isRefreshingIdentity.value = false
+                if (showCheckingState) {
+                    _isRefreshingIdentity.value = false
+                }
             }
         }
     }
@@ -182,9 +247,13 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
     fun verifySessionOnLaunch(onResult: (isAllowed: Boolean) -> Unit) {
         viewModelScope.launch {
             _isVerifying.value = true
-            _dbConnectionStatus.value = DbConnectionStatus.Checking
+            if (_dbConnectionStatus.value !is DbConnectionStatus.Connected) {
+                _dbConnectionStatus.value = DbConnectionStatus.Checking
+            }
             try {
-                val outcome = repo.verifyCurrentSession(getApplication())
+                val outcome = syncMutex.withLock {
+                    repo.verifyCurrentSession(getApplication())
+                }
                 _identitySnapshot.value = UserIdentityManager.getCachedSnapshot(getApplication())
                 _activeSubscription.value = outcome.activeInfo
                 _freeAccessState.value = outcome.freeAccessState
@@ -192,7 +261,6 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                 _isExplicitlyLocked.value = !outcome.isAllowed && outcome.activeInfo == null && !outcome.freeAccessState.isExhausted
                 _gateError.value = outcome.errorMessage
                 _isConnectionError.value = outcome.isConnectionError
-                _isDemoTrialExhausted.value = repo.isDemoTrialExhausted()
                 onResult(outcome.isAllowed)
             } finally {
                 _isVerifying.value = false
@@ -215,9 +283,9 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                         _gateError.value = null
                         _isConnectionError.value = false
                         if (repo.isDatabaseConfigured()) {
-                            _dbConnectionStatus.value = DbConnectionStatus.Connected("تم التحقق من قاعدة البيانات وتفعيل الاشتراك")
+                            _dbConnectionStatus.value = DbConnectionStatus.Connected("متصل")
                         }
-                        _isDemoTrialExhausted.value = repo.isDemoTrialExhausted()
+                        repo.syncAllClientsToDatabase(getApplication())
                         onUnlocked()
                     }
                     is ActivationResult.Failure -> {
@@ -227,9 +295,8 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                         if (result.isConnectionError && repo.isDatabaseConfigured()) {
                             _dbConnectionStatus.value = DbConnectionStatus.Disconnected(result.reason)
                         } else if (!result.isConnectionError && repo.isDatabaseConfigured()) {
-                            _dbConnectionStatus.value = DbConnectionStatus.Connected("متصل بقاعدة البيانات PostgreSQL")
+                            _dbConnectionStatus.value = DbConnectionStatus.Connected("متصل")
                         }
-                        _isDemoTrialExhausted.value = repo.isDemoTrialExhausted()
                     }
                 }
             } finally {
@@ -249,7 +316,7 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                     is ReviewRequestResult.Success -> {
                         _identitySnapshot.value = UserIdentityManager.getCachedSnapshot(getApplication())
                         _reviewNotice.value = result.message
-                        _dbConnectionStatus.value = DbConnectionStatus.Connected("تم إرسال طلب المراجعة إلى قاعدة البيانات")
+                        _dbConnectionStatus.value = DbConnectionStatus.Connected("متصل")
                     }
                     is ReviewRequestResult.Failure -> {
                         _gateError.value = result.reason
@@ -273,7 +340,6 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
             _gateError.value = null
             _reviewNotice.value = null
             _isConnectionError.value = false
-            _isDemoTrialExhausted.value = repo.isDemoTrialExhausted()
             onLocked()
         }
     }

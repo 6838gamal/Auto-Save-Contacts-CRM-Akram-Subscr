@@ -3,11 +3,14 @@ package gamalprojects.autosavecontactscrm.akramalahmadi.repositories
 import android.content.Context
 import gamalprojects.autosavecontactscrm.akramalahmadi.BuildConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
+import gamalprojects.autosavecontactscrm.akramalahmadi.database.Contact
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.SettingEntity
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.SubscriptionCodeEntity
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.UserDeviceProfileEntity
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityManager
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserNetworkSnapshot
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncBatchRequest
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncItem
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresConnectionConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSubscriptionGateway
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionActivateRequest
@@ -27,6 +30,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 
 sealed class DbConnectionStatus {
@@ -116,18 +120,14 @@ class SubscriptionRepository(
         private const val KEY_SUBSCRIPTION_LOCKED = "subscription_explicitly_locked"
         private const val KEY_FREE_USED = "free_contacts_used"
         private const val KEY_FREE_EXHAUSTED = "free_tier_exhausted"
+        private const val KEY_PENDING_DELETED_CLIENTS = "pending_deleted_clients_json"
 
         const val FREE_CONTACTS_LIMIT = 100
         const val ADMIN_PHONE_DISPLAY = "+967 772 920 748"
         const val ADMIN_PHONE_DIGITS = "967772920748"
 
-        const val DEMO_TRIAL_CODE = "TRIAL-2026"
-        const val DEMO_TRIAL_DURATION_MINUTES = 7L * 24L * 60L // 7 days
-        const val DEMO_TRIAL_MAX_CONTACTS = 200
         const val MSG_CONTACT_OWNER_OFFLINE =
             "يرجى التواصل مع الإدارة لمراجعة الأمر والتحقق من الاتصال على الرقم $ADMIN_PHONE_DISPLAY"
-        const val MSG_TRIAL_QUOTA_EXCEEDED =
-            "وصلت للحد الأقصى للنسخة التجريبية ($DEMO_TRIAL_MAX_CONTACTS جهة اتصال). يرجى إدخال كود اشتراك مدفوع أو التواصل مع الإدارة على $ADMIN_PHONE_DISPLAY"
         const val MSG_FREE_LIMIT_REACHED =
             "لقد وصلت إلى الحد المجاني المسموح ($FREE_CONTACTS_LIMIT جهة اتصال). يرجى إدخال كود اشتراك صحيح للمتابعة أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
         const val MSG_DB_NOT_CONFIGURED =
@@ -225,12 +225,6 @@ class SubscriptionRepository(
         settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
     }
 
-    suspend fun isDemoTrialExhausted(): Boolean = withContext(Dispatchers.IO) {
-        val demo = codeDao.getCode(DEMO_TRIAL_CODE) ?: return@withContext false
-        val max = demo.maxContacts ?: DEMO_TRIAL_MAX_CONTACTS
-        !demo.isActive || (max > 0 && demo.usedContacts >= max)
-    }
-
     suspend fun captureIdentity(context: Context): UserNetworkSnapshot = withContext(Dispatchers.IO) {
         val snapshot = UserIdentityManager.fetchPublicNetworkInfo(context)
         upsertUserProfile(snapshot, activeCode = null)
@@ -264,6 +258,9 @@ class SubscriptionRepository(
             settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
             upsertUserProfile(snapshot, activeCode = null)
             val syncStatus = pingAndSyncUserOnly(snapshot, totalContacts, freeState, null)
+            if (syncStatus is DbConnectionStatus.Connected) {
+                syncAllClientsToDatabase(context)
+            }
             return@withContext SessionVerifyOutcome(
                 activeInfo = null,
                 freeAccessState = freeState,
@@ -276,16 +273,15 @@ class SubscriptionRepository(
 
         // Local quota guard
         if (cached != null && cached.maxContacts != null && cached.maxContacts > 0 && cached.usedContacts >= cached.maxContacts) {
-            val msg = if (cached.isTrial) {
-                MSG_TRIAL_QUOTA_EXCEEDED
-            } else {
-                "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
-            }
+            val msg = "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
             settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
             settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
             settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
             upsertUserProfile(snapshot, activeCode = null)
             val syncStatus = pingAndSyncUserOnly(snapshot, totalContacts, freeState, null)
+            if (syncStatus is DbConnectionStatus.Connected) {
+                syncAllClientsToDatabase(context)
+            }
             return@withContext SessionVerifyOutcome(
                 activeInfo = null,
                 freeAccessState = freeState,
@@ -298,7 +294,7 @@ class SubscriptionRepository(
 
         val pgGateway = resolvePostgresGateway()
         if (pgGateway != null) {
-            return@withContext verifyViaDirectPostgres(
+            val outcome = verifyViaDirectPostgres(
                 gateway = pgGateway,
                 snapshot = snapshot,
                 freeState = freeState,
@@ -307,11 +303,15 @@ class SubscriptionRepository(
                 cachedUsedQuota = cached?.usedContacts ?: 0,
                 explicitlyLocked = explicitlyLocked
             )
+            if (outcome.dbStatus is DbConnectionStatus.Connected) {
+                syncAllClientsToDatabase(context)
+            }
+            return@withContext outcome
         }
 
         val api = resolveApiService()
         if (api != null) {
-            return@withContext verifyViaHttpApi(
+            val outcome = verifyViaHttpApi(
                 api = api,
                 snapshot = snapshot,
                 freeState = freeState,
@@ -320,6 +320,10 @@ class SubscriptionRepository(
                 cachedUsedQuota = cached?.usedContacts ?: 0,
                 explicitlyLocked = explicitlyLocked
             )
+            if (outcome.dbStatus is DbConnectionStatus.Connected) {
+                syncAllClientsToDatabase(context)
+            }
+            return@withContext outcome
         }
 
         // Database not configured: app still works normally and prompts to contact administration for review
@@ -482,11 +486,11 @@ class SubscriptionRepository(
 
             val connectedOk = connectResp?.isSuccessful == true
             val dbStatus = if (connectedOk) {
-                DbConnectionStatus.Connected("متصل بخادم PostgreSQL وتم إرسال بيانات المستخدم")
+                DbConnectionStatus.Connected("متصل")
             } else if (connectResp != null && connectResp.code() >= 500) {
                 throw IllegalStateException("Server 5xx")
             } else {
-                DbConnectionStatus.Connected("متصل بقاعدة البيانات")
+                DbConnectionStatus.Connected("متصل")
             }
 
             if (activeCodeKey.isNullOrBlank()) {
@@ -526,7 +530,7 @@ class SubscriptionRepository(
                 val failureReason = validateApiStatusFlags(body, cachedUsedQuota)
                 if (body != null && failureReason == null) {
                     val info = persistActiveSubscription(activeCodeKey, body, snapshot, existingUsed = cachedUsedQuota)
-                    SessionVerifyOutcome(info, freeState, true, DbConnectionStatus.Connected("متصل بقاعدة البيانات والاشتراك مفعل"), null, false)
+                    SessionVerifyOutcome(info, freeState, true, DbConnectionStatus.Connected("متصل"), null, false)
                 } else {
                     val err = failureReason ?: MSG_CONTACT_OWNER_OFFLINE
                     settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
@@ -604,7 +608,7 @@ class SubscriptionRepository(
                     )
                 )
                 if (resp.isSuccessful) {
-                    DbConnectionStatus.Connected("متصل بقاعدة البيانات")
+                    DbConnectionStatus.Connected("متصل")
                 } else {
                     DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
                 }
@@ -713,10 +717,7 @@ class SubscriptionRepository(
             }
         }
 
-        // 3. No DATABASE_URL configured yet -> only demo TRIAL-2026 allowed locally
-        if (code == DEMO_TRIAL_CODE) {
-            return@withContext activateDemoTrialCode(snapshot)
-        }
+        // 3. No DATABASE_URL configured yet -> prompt to contact administration
         return@withContext ActivationResult.Failure(
             reason = MSG_DB_NOT_CONFIGURED,
             isConnectionError = true
@@ -838,18 +839,14 @@ class SubscriptionRepository(
 
         val updated = entity.copy(
             usedContacts = nextUsed,
-            isActive = if (reachedLimit && entity.isTrial) false else entity.isActive
+            isActive = if (reachedLimit) false else entity.isActive
         )
         codeDao.upsertCode(updated)
 
         syncUsageToBackend(context, updated.code, nextUsed)
 
         if (reachedLimit) {
-            val lockMessage = if (entity.isTrial) {
-                MSG_TRIAL_QUOTA_EXCEEDED
-            } else {
-                "تم استهلاك الحد الأقصى لحفظ جهات الاتصال ($max جهة اتصال). يرجى إدخال كود اشتراك جديد."
-            }
+            val lockMessage = "تم استهلاك الحد الأقصى لحفظ جهات الاتصال ($max جهة اتصال). يرجى إدخال كود اشتراك جديد."
             settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, lockMessage))
             settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
             settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
@@ -911,70 +908,202 @@ class SubscriptionRepository(
         val effectiveUsed = maxOf(localUsed, body.usedContacts)
         val max = body.maxContacts
         if (max != null && max > 0 && effectiveUsed >= max) {
-            return if (body.isTrial) {
-                MSG_TRIAL_QUOTA_EXCEEDED
-            } else {
-                body.message.ifBlank { "تم الوصول إلى الحد الأقصى لحفظ جهات الاتصال ($max جهة اتصال)." }
-            }
+            return body.message.ifBlank { "تم الوصول إلى الحد الأقصى لحفظ جهات الاتصال ($max جهة اتصال)." }
         }
         return null
     }
 
-    private suspend fun activateDemoTrialCode(snapshot: UserNetworkSnapshot): ActivationResult {
-        val now = System.currentTimeMillis()
-        val existing = codeDao.getCode(DEMO_TRIAL_CODE)
-        if (existing != null) {
-            if (!existing.boundUserId.isNullOrBlank() && existing.boundUserId != snapshot.userId) {
-                return ActivationResult.Failure(
-                    reason = "الكود التجريبي مرتبط بمعرف مستخدم آخر ولا يمكن تكراره.",
-                    isConnectionError = false
-                )
-            }
-            val max = existing.maxContacts ?: DEMO_TRIAL_MAX_CONTACTS
-            if (!existing.isActive || (max > 0 && existing.usedContacts >= max)) {
-                return ActivationResult.Failure(
-                    reason = MSG_TRIAL_QUOTA_EXCEEDED,
-                    isConnectionError = false
-                )
-            }
-            if (existing.expiresAt != null && now >= existing.expiresAt) {
-                return ActivationResult.Failure(
-                    reason = "انتهت مدة الكود التجريبي الافتراضي. يرجى إدخال كود مدفوع أو التواصل مع صاحب المشروع.",
-                    isConnectionError = false
-                )
-            }
-            settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
-            settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
-            settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, existing.code))
-            upsertUserProfile(snapshot, activeCode = existing.code)
-            return ActivationResult.Success(
-                info = existing.toActiveInfo(snapshot),
-                snapshot = snapshot,
-                message = "تم تفعيل الكود التجريبي بنجاح (الحد الأقصى $max جهة اتصال)."
-            )
+    suspend fun syncSingleClientToDatabase(
+        context: Context,
+        contact: Contact,
+        isDeleted: Boolean = false
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (isDeleted) {
+            markPendingClientDeleted(contact)
+        } else {
+            unmarkPendingClientDeleted(contact.phone)
         }
 
-        val response = SubscriptionApiResponse(
-            valid = true,
-            isSubscribed = true,
-            isActive = true,
-            isTrial = true,
-            status = "active",
-            message = "تم تفعيل الكود التجريبي (7 أيام / حد أقصى 200 جهة اتصال)",
-            code = DEMO_TRIAL_CODE,
-            planLabel = "باقة تجريبية (حد 200 جهة اتصال)",
-            durationMinutes = DEMO_TRIAL_DURATION_MINUTES,
-            isLifetime = false,
-            maxContacts = DEMO_TRIAL_MAX_CONTACTS,
-            usedContacts = 0,
-            activatedAt = now,
-            expiresAt = now + DEMO_TRIAL_DURATION_MINUTES * 60_000L,
-            boundUserId = snapshot.userId,
-            boundIp = snapshot.publicIp
+        val item = contact.toClientSyncItem(isDeleted = isDeleted)
+        val snapshot = UserIdentityManager.getCachedSnapshot(context)
+
+        val pgGateway = resolvePostgresGateway()
+        if (pgGateway != null) {
+            return@withContext try {
+                pgGateway.syncClientsBatch(snapshot.userId, listOf(item))
+                if (isDeleted) {
+                    unmarkPendingClientDeleted(contact.phone)
+                }
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                false
+            }
+        }
+
+        val api = resolveApiService() ?: return@withContext false
+        val (authHeader, apiKeyHeader) = resolveAuthHeaders()
+        return@withContext try {
+            val resp = api.syncClients(
+                authorization = authHeader,
+                apiKey = apiKeyHeader,
+                request = ClientSyncBatchRequest(
+                    userId = snapshot.userId,
+                    publicIp = snapshot.publicIp,
+                    clients = listOf(item)
+                )
+            )
+            if (resp.isSuccessful) {
+                if (isDeleted) {
+                    unmarkPendingClientDeleted(contact.phone)
+                }
+                true
+            } else {
+                false
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    suspend fun syncAllClientsToDatabase(context: Context): Boolean = withContext(Dispatchers.IO) {
+        val pgGateway = resolvePostgresGateway()
+        val api = if (pgGateway == null) resolveApiService() else null
+        if (pgGateway == null && api == null) return@withContext false
+
+        val contacts = contactDao.getAllContactsSync()
+        val activePhones = contacts.mapTo(HashSet()) { it.phone }
+        val pendingDeletes = loadPendingDeletedClients().filterNot { it.phone in activePhones }
+        if (pendingDeletes.size != loadPendingDeletedClients().size) {
+            savePendingDeletedClients(pendingDeletes)
+        }
+
+        val items = contacts.map { it.toClientSyncItem(isDeleted = false) } + pendingDeletes
+        if (items.isEmpty()) return@withContext true
+
+        val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        if (pgGateway != null) {
+            return@withContext try {
+                pgGateway.syncClientsBatch(snapshot.userId, items)
+                if (pendingDeletes.isNotEmpty()) {
+                    savePendingDeletedClients(emptyList())
+                }
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                false
+            }
+        }
+
+        val (authHeader, apiKeyHeader) = resolveAuthHeaders()
+        return@withContext try {
+            val resp = api!!.syncClients(
+                authorization = authHeader,
+                apiKey = apiKeyHeader,
+                request = ClientSyncBatchRequest(
+                    userId = snapshot.userId,
+                    publicIp = snapshot.publicIp,
+                    clients = items
+                )
+            )
+            if (resp.isSuccessful) {
+                if (pendingDeletes.isNotEmpty()) {
+                    savePendingDeletedClients(emptyList())
+                }
+                true
+            } else {
+                false
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun Contact.toClientSyncItem(isDeleted: Boolean): ClientSyncItem {
+        return ClientSyncItem(
+            phone = phone,
+            originalPhone = originalPhone,
+            name = name,
+            source = source,
+            createdAt = timestamp,
+            lastActivity = lastActivity,
+            interactionCount = interactionCount,
+            isSyncedToPhone = isSyncedToPhone,
+            isDeleted = isDeleted
         )
-        settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
-        val info = persistActiveSubscription(DEMO_TRIAL_CODE, response, snapshot, existingUsed = 0)
-        return ActivationResult.Success(info, snapshot, response.message)
+    }
+
+    private suspend fun markPendingClientDeleted(contact: Contact) {
+        val existing = loadPendingDeletedClients().filterNot { it.phone == contact.phone }.toMutableList()
+        existing.add(contact.toClientSyncItem(isDeleted = true))
+        savePendingDeletedClients(existing)
+    }
+
+    private suspend fun unmarkPendingClientDeleted(normalizedPhone: String) {
+        val existing = loadPendingDeletedClients()
+        val filtered = existing.filterNot { it.phone == normalizedPhone }
+        if (filtered.size != existing.size) {
+            savePendingDeletedClients(filtered)
+        }
+    }
+
+    private suspend fun loadPendingDeletedClients(): List<ClientSyncItem> {
+        val raw = settingDao.getSetting(KEY_PENDING_DELETED_CLIENTS)?.value.orEmpty()
+        if (raw.isBlank()) return emptyList()
+        return try {
+            val array = JSONArray(raw)
+            buildList(array.length()) {
+                for (i in 0 until array.length()) {
+                    val obj = array.optJSONObject(i) ?: continue
+                    val phone = obj.optString("phone")
+                    if (phone.isBlank()) continue
+                    add(
+                        ClientSyncItem(
+                            phone = phone,
+                            originalPhone = obj.optString("original_phone", phone),
+                            name = obj.optString("name", ""),
+                            source = obj.optString("source", ""),
+                            createdAt = obj.optLong("created_at", 0L),
+                            lastActivity = obj.optLong("last_activity", 0L),
+                            interactionCount = obj.optInt("interaction_count", 1),
+                            isSyncedToPhone = obj.optBoolean("is_synced_to_phone", false),
+                            isDeleted = true
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private suspend fun savePendingDeletedClients(items: List<ClientSyncItem>) {
+        if (items.isEmpty()) {
+            settingDao.insertSetting(SettingEntity(KEY_PENDING_DELETED_CLIENTS, ""))
+            return
+        }
+        val array = JSONArray()
+        for (item in items) {
+            array.put(
+                JSONObject().apply {
+                    put("phone", item.phone)
+                    put("original_phone", item.originalPhone)
+                    put("name", item.name)
+                    put("source", item.source)
+                    put("created_at", item.createdAt)
+                    put("last_activity", item.lastActivity)
+                    put("interaction_count", item.interactionCount)
+                    put("is_synced_to_phone", item.isSyncedToPhone)
+                }
+            )
+        }
+        settingDao.insertSetting(SettingEntity(KEY_PENDING_DELETED_CLIENTS, array.toString()))
     }
 
     suspend fun lockSession(explicitLock: Boolean = true) = withContext(Dispatchers.IO) {
@@ -1002,7 +1131,7 @@ class SubscriptionRepository(
                 null
             }
         }
-        val label = body.planLabel.ifBlank { if (body.isTrial) "باقة تجريبية" else "اشتراك مفعل" }
+        val label = body.planLabel.ifBlank { "اشتراك مفعل" }
         val boundUser = body.boundUserId?.ifBlank { null } ?: snapshot.userId
         val boundIp = body.boundIp?.ifBlank { null } ?: snapshot.publicIp
         val normalizedMax = body.maxContacts?.takeIf { it > 0 }
@@ -1027,7 +1156,7 @@ class SubscriptionRepository(
                 boundDeviceModel = snapshot.deviceModel,
                 activatedAt = activatedAt,
                 expiresAt = expiresAt,
-                sourceType = if (resolvedCode == DEMO_TRIAL_CODE && !isDatabaseConfigured()) "DEMO_TRIAL" else "POSTGRES_DB"
+                sourceType = "POSTGRES_DB"
             )
         )
         settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, resolvedCode))
@@ -1054,7 +1183,7 @@ class SubscriptionRepository(
     private fun SubscriptionCodeEntity.toActiveInfo(snapshot: UserNetworkSnapshot? = null): ActiveSubscriptionInfo {
         return ActiveSubscriptionInfo(
             code = code,
-            label = label.ifBlank { if (isTrial) "باقة تجريبية" else "اشتراك مفعل" },
+            label = label.ifBlank { "اشتراك مفعل" },
             isLifetime = isLifetime,
             isSubscribed = isSubscribed,
             isActive = isActive,

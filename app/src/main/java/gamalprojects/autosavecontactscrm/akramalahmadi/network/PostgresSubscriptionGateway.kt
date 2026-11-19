@@ -43,7 +43,7 @@ class PostgresSubscriptionGateway(
             val approvedCode = findApprovedCodeForUser(client, snapshot, activeCode)
             return RemoteConnectOutcome(
                 connected = true,
-                message = "متصل بقاعدة البيانات PostgreSQL (${config.database}) وتم إرسال بياناتك بنجاح",
+                message = "متصل",
                 activeSubscription = approvedCode
             )
         }
@@ -246,7 +246,7 @@ class PostgresSubscriptionGateway(
                 status = "active",
                 message = "تم التحقق من قاعدة البيانات وتفعيل الاشتراك بنجاح.",
                 code = dbCode,
-                planLabel = planLabel.ifBlank { if (isTrial) "باقة تجريبية" else "اشتراك مفعل" },
+                planLabel = planLabel.ifBlank { "اشتراك مفعل" },
                 durationMinutes = durationMinutes,
                 isLifetime = isLifetime,
                 maxContacts = maxContacts,
@@ -417,6 +417,54 @@ class PostgresSubscriptionGateway(
         }
     }
 
+    fun syncClientsBatch(
+        userId: String,
+        clients: List<ClientSyncItem>
+    ) {
+        if (clients.isEmpty()) return
+        clientFactory(config).use { client ->
+            client.connect()
+            ensureSchema(client)
+            for (item in clients) {
+                client.query(
+                    """
+                    INSERT INTO crm_clients (
+                        user_id, phone, original_phone, name, source,
+                        created_at, last_activity, interaction_count,
+                        is_synced_to_phone, is_deleted, updated_at
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5,
+                        $6::bigint, $7::bigint, $8::int,
+                        $9::boolean, $10::boolean, NOW()
+                    )
+                    ON CONFLICT (user_id, phone) DO UPDATE SET
+                        original_phone = EXCLUDED.original_phone,
+                        name = EXCLUDED.name,
+                        source = EXCLUDED.source,
+                        last_activity = GREATEST(crm_clients.last_activity, EXCLUDED.last_activity),
+                        interaction_count = GREATEST(crm_clients.interaction_count, EXCLUDED.interaction_count),
+                        is_synced_to_phone = crm_clients.is_synced_to_phone OR EXCLUDED.is_synced_to_phone,
+                        is_deleted = EXCLUDED.is_deleted,
+                        updated_at = NOW()
+                    """.trimIndent(),
+                    listOf(
+                        userId,
+                        item.phone,
+                        item.originalPhone,
+                        item.name,
+                        item.source,
+                        item.createdAt.toString(),
+                        item.lastActivity.toString(),
+                        item.interactionCount.toString(),
+                        item.isSyncedToPhone.toString(),
+                        item.isDeleted.toString()
+                    )
+                )
+            }
+        }
+    }
+
     private fun ensureSchema(client: PostgresWireClient) {
         client.executeSimple(
             """
@@ -479,6 +527,24 @@ class PostgresSubscriptionGateway(
                 notes TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """.trimIndent()
+        )
+        client.executeSimple(
+            """
+            CREATE TABLE IF NOT EXISTS crm_clients (
+                user_id TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                original_phone TEXT NOT NULL,
+                name TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                created_at BIGINT NOT NULL,
+                last_activity BIGINT NOT NULL,
+                interaction_count INTEGER NOT NULL DEFAULT 1,
+                is_synced_to_phone BOOLEAN NOT NULL DEFAULT FALSE,
+                is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, phone)
             )
             """.trimIndent()
         )

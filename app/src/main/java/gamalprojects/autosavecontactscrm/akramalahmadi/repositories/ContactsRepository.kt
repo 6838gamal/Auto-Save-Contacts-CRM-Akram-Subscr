@@ -17,6 +17,7 @@ class ContactsRepository(private val db: AppDatabase) {
     private val logEntryDao = db.logEntryDao()
     private val phoneEventDao = db.phoneEventDao()
     private val settingDao = db.settingDao()
+    private val subscriptionRepo = SubscriptionRepository(db)
 
     val allContacts: Flow<List<Contact>> = contactDao.getAllContacts()
     val allLogs: Flow<List<LogEntry>> = logEntryDao.getAllLogs()
@@ -75,11 +76,11 @@ class ContactsRepository(private val db: AppDatabase) {
                     details = "تحديث آخر نشاط للعميل ${existingContact.name}. عدد التفاعلات: ${updated.interactionCount}"
                 )
             )
+            subscriptionRepo.syncSingleClientToDatabase(context, updated, isDeleted = false)
             return@withContext true
         }
 
         // 5. Check subscription & usage quota before saving any new contact
-        val subscriptionRepo = SubscriptionRepository(db)
         if (!subscriptionRepo.canSaveNewContact()) {
             logEntryDao.insertLog(
                 LogEntry(
@@ -138,8 +139,9 @@ class ContactsRepository(private val db: AppDatabase) {
             "تم التعرف على تواصل من رقم جديد وحفظه باسم '$clientName'"
         )
 
-        // Record contact against active subscription quota (locks session when limit e.g. 200 is reached)
+        // Record contact against free limit (100) or active subscription quota
         subscriptionRepo.recordContactSaved(context)
+        subscriptionRepo.syncSingleClientToDatabase(context, newContact, isDeleted = false)
 
         return@withContext true
     }
@@ -177,10 +179,11 @@ class ContactsRepository(private val db: AppDatabase) {
                 details = "تم تعديل اسم العميل من ${contact.name} إلى $newName"
             )
         )
+        subscriptionRepo.syncSingleClientToDatabase(context, updated, isDeleted = false)
         return@withContext true
     }
 
-    suspend fun deleteContact(contact: Contact) = withContext(Dispatchers.IO) {
+    suspend fun deleteContact(context: Context, contact: Contact) = withContext(Dispatchers.IO) {
         contactDao.deleteContact(contact)
         logEntryDao.insertLog(
             LogEntry(
@@ -190,6 +193,7 @@ class ContactsRepository(private val db: AppDatabase) {
                 details = "تم حذف ${contact.name} من سجلات الـ CRM"
             )
         )
+        subscriptionRepo.syncSingleClientToDatabase(context, contact, isDeleted = true)
     }
 
     suspend fun clearLogs() = withContext(Dispatchers.IO) {

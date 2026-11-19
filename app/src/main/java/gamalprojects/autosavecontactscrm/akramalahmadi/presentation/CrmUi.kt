@@ -533,7 +533,7 @@ fun DashboardScreen(
                     isBusy = isRefreshingDb,
                     onRetrySync = {
                         subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
-                            Toast.makeText(context, "تم تفعيل اشتراكك عبر PostgreSQL!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         })
                     }
                 )
@@ -1416,7 +1416,7 @@ fun SettingsScreen(
                     isBusy = isRefreshingDb,
                     onRetrySync = {
                         subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
-                            Toast.makeText(context, "تم تفعيل اشتراكك عبر PostgreSQL!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         })
                     }
                 )

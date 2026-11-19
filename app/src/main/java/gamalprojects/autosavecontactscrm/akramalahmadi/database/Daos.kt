@@ -8,6 +8,9 @@ interface ContactDao {
     @Query("SELECT * FROM contacts_table ORDER BY timestamp DESC")
     fun getAllContacts(): Flow<List<Contact>>
 
+    @Query("SELECT * FROM contacts_table ORDER BY timestamp DESC")
+    suspend fun getAllContactsSync(): List<Contact>
+
     @Query("SELECT * FROM contacts_table WHERE phone = :phone LIMIT 1")
     suspend fun getContactByPhone(phone: String): Contact?
 
