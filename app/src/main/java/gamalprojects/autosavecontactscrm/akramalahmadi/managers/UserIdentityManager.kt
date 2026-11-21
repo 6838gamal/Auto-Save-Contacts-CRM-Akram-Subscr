@@ -69,6 +69,32 @@ object UserIdentityManager {
         }
     }
 
+    fun hasImmutableAndroidId(androidId: String): Boolean {
+        return androidId.isNotBlank() && androidId != "android_id_unavailable"
+    }
+
+    /**
+     * Returns the device identifier that does not change across app restarts,
+     * updates, or reinstalls (Settings.Secure.ANDROID_ID), falling back to a
+     * persisted UUID only when ANDROID_ID is unavailable on the host environment.
+     */
+    fun getImmutableDeviceId(context: Context): String {
+        val androidId = getAndroidId(context)
+        return if (hasImmutableAndroidId(androidId)) {
+            androidId
+        } else {
+            getOrCreateInstallUuid(context)
+        }
+    }
+
+    fun getImmutableDeviceId(snapshot: UserNetworkSnapshot): String {
+        return if (hasImmutableAndroidId(snapshot.androidId)) {
+            snapshot.androidId
+        } else {
+            snapshot.userId.ifBlank { snapshot.installUuid }
+        }
+    }
+
     fun getOrCreateInstallUuid(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val existing = prefs.getString(KEY_INSTALL_UUID, null)
@@ -80,12 +106,12 @@ object UserIdentityManager {
 
     /**
      * Produces a deterministic, collision-resistant user identifier (USR-XXXXXXXXXX)
-     * combining ANDROID_ID and the persisted installation UUID.
+     * strictly derived from the immutable device identifier so it remains constant
+     * across app restarts, data updates, and reinstalls.
      */
     fun getStableUserId(context: Context): String {
-        val androidId = getAndroidId(context)
-        val installUuid = getOrCreateInstallUuid(context)
-        val raw = "$androidId|$installUuid|${context.packageName}"
+        val immutableDeviceId = getImmutableDeviceId(context)
+        val raw = "$immutableDeviceId|${context.packageName}"
         val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
         val hex = digest.take(5).joinToString("") { "%02X".format(it) }
         return "USR-$hex"

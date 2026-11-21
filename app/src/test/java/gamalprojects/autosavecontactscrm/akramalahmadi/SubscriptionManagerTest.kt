@@ -1,15 +1,20 @@
 package gamalprojects.autosavecontactscrm.akramalahmadi
 
 import android.content.Context
+import android.provider.Settings
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.Contact
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityManager
+import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserNetworkSnapshot
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncBatchRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncItem
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresConnectionConfig
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresQueryResult
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSqlExecutor
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSslMode
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSubscriptionGateway
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionActivateRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiResponse
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiService
@@ -20,6 +25,7 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionVerif
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ActivationResult
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ContactsRepository
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.DbConnectionStatus
+import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.FreeAccessState
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ReviewRequestResult
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.SubscriptionRepository
 import kotlinx.coroutines.test.runTest
@@ -546,7 +552,7 @@ class SubscriptionManagerTest {
         }
 
         // Offline / unconfigured check: TRIAL-2026 has zero special demo bypass anymore
-        val offlineRepo = SubscriptionRepository(db, apiServiceOverride = null)
+        val offlineRepo = SubscriptionRepository(db, apiServiceOverride = mockApi)
         val noDemoBypass = offlineRepo.activateSubscriptionCode(context, "TRIAL-2026")
         assertTrue(noDemoBypass is ActivationResult.Failure)
 
@@ -891,5 +897,155 @@ class SubscriptionManagerTest {
         assertEquals(100, exhaustedTelemetry.freeContactsLimit)
         assertTrue(exhaustedTelemetry.freeTierExhausted)
         assertNull(exhaustedTelemetry.activeCode)
+    }
+
+    @Test
+    fun `immutable device id keeps stable userId even if install preferences are cleared`() {
+        Settings.Secure.putString(context.contentResolver, Settings.Secure.ANDROID_ID, "fixed_device_hw_998877")
+
+        val firstDeviceId = UserIdentityManager.getImmutableDeviceId(context)
+        val firstUserId = UserIdentityManager.getStableUserId(context)
+        assertEquals("fixed_device_hw_998877", firstDeviceId)
+
+        // Simulate clearing app storage / reinstalling (wiping install_uuid preference)
+        context.getSharedPreferences("subscription_identity_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
+
+        val afterClearDeviceId = UserIdentityManager.getImmutableDeviceId(context)
+        val afterClearUserId = UserIdentityManager.getStableUserId(context)
+        assertEquals(firstDeviceId, afterClearDeviceId)
+        assertEquals(firstUserId, afterClearUserId)
+    }
+
+    @Test
+    fun `postgres gateway checks device existence first before inserting and updates by immutable device id`() = runTest {
+        val executedQueries = mutableListOf<Pair<String, List<String?>>>()
+        val storedUsers = mutableMapOf<String, MutableMap<String, String?>>()
+
+        val fakeConfig = PostgresConnectionConfig(
+            host = "localhost",
+            port = 5432,
+            database = "crm_test",
+            username = "crm",
+            password = "secret",
+            sslMode = PostgresSslMode.DISABLE
+        )
+
+        val gateway = PostgresSubscriptionGateway(fakeConfig) {
+            object : PostgresSqlExecutor {
+                override fun connect() {}
+                override fun close() {}
+                override fun executeSimple(sql: String): PostgresQueryResult =
+                    PostgresQueryResult(emptyList(), emptyList())
+
+                override fun query(sql: String, params: List<String?>): PostgresQueryResult {
+                    val normalized = sql.trim()
+                    executedQueries.add(normalized to params)
+
+                    return when {
+                        normalized.startsWith("SELECT user_id, device_id, android_id", ignoreCase = true) -> {
+                            val reqDeviceId = params.getOrNull(0).orEmpty()
+                            val reqAndroidId = params.getOrNull(1).orEmpty()
+                            val reqUserId = params.getOrNull(2).orEmpty()
+                            val matched = storedUsers.values.firstOrNull { row ->
+                                (row["device_id"] == reqDeviceId && reqDeviceId.isNotBlank()) ||
+                                    (row["android_id"] == reqAndroidId && reqAndroidId != "android_id_unavailable" && reqAndroidId.isNotBlank()) ||
+                                    row["user_id"] == reqUserId
+                            }
+                            PostgresQueryResult(emptyList(), if (matched != null) listOf(matched) else emptyList())
+                        }
+                        normalized.startsWith("INSERT INTO crm_users", ignoreCase = true) -> {
+                            val row = mutableMapOf<String, String?>(
+                                "user_id" to params[0],
+                                "device_id" to params[1],
+                                "android_id" to params[2],
+                                "install_uuid" to params[3],
+                                "public_ip" to params[4],
+                                "local_ip" to params[5],
+                                "saved_contacts_count" to params[10],
+                                "free_contacts_used" to params[11],
+                                "free_contacts_limit" to params[12],
+                                "free_tier_exhausted" to params[13],
+                                "plan_type" to params[14],
+                                "active_code" to params[15],
+                                "is_subscribed" to params[16]
+                            )
+                            storedUsers[params[0]!!] = row
+                            PostgresQueryResult(emptyList(), emptyList())
+                        }
+                        normalized.startsWith("UPDATE crm_users", ignoreCase = true) -> {
+                            val targetUserId = params[0]!!
+                            val row = storedUsers[targetUserId]
+                            if (row != null) {
+                                row["device_id"] = params[1]
+                                row["android_id"] = params[2]
+                                row["install_uuid"] = params[3]
+                                row["public_ip"] = params[4]
+                                row["local_ip"] = params[5]
+                                row["free_contacts_used"] = maxOf(
+                                    row["free_contacts_used"]?.toIntOrNull() ?: 0,
+                                    params[11]?.toIntOrNull() ?: 0
+                                ).toString()
+                                row["free_tier_exhausted"] = params[13]
+                                row["plan_type"] = params[14]
+                            }
+                            PostgresQueryResult(emptyList(), emptyList())
+                        }
+                        else -> PostgresQueryResult(emptyList(), emptyList())
+                    }
+                }
+            }
+        }
+
+        val initialSnapshot = UserNetworkSnapshot(
+            userId = "USR-IMMUTABLE01",
+            androidId = "hw_android_id_777",
+            installUuid = "install-uuid-first",
+            publicIp = "1.2.3.4",
+            localIp = "192.168.1.10",
+            locationInfo = "Sanaa",
+            deviceModel = "Pixel 8",
+            osVersion = "Android 15",
+            networkType = "Wi-Fi"
+        )
+
+        // 1. First connection: must SELECT first, see nothing, then INSERT once
+        gateway.connectAndSyncUser(
+            snapshot = initialSnapshot,
+            totalContacts = 5,
+            freeState = FreeAccessState(usedContacts = 5, limit = 100, isExhausted = false),
+            activeCode = null
+        )
+
+        assertTrue(executedQueries[0].first.startsWith("SELECT user_id, device_id, android_id"))
+        assertTrue(executedQueries.any { it.first.startsWith("INSERT INTO crm_users") })
+        assertFalse(executedQueries.any { it.first.startsWith("UPDATE crm_users") })
+        assertEquals(1, storedUsers.size)
+
+        // 2. App restarts / reinstalls (even if installUuid or publicIp changes) -> same immutable device ID
+        // Must SELECT first, find existing row, and UPDATE instead of inserting a duplicate
+        executedQueries.clear()
+        val restartedSnapshot = initialSnapshot.copy(
+            installUuid = "install-uuid-after-reinstall",
+            publicIp = "5.6.7.8",
+            networkType = "بيانات الهاتف"
+        )
+        val reconnectOutcome = gateway.connectAndSyncUser(
+            snapshot = restartedSnapshot,
+            totalContacts = 12,
+            freeState = FreeAccessState(usedContacts = 12, limit = 100, isExhausted = false),
+            activeCode = null
+        )
+
+        assertTrue(reconnectOutcome.connected)
+        assertEquals(12, reconnectOutcome.serverFreeUsed)
+        assertTrue(executedQueries[0].first.startsWith("SELECT user_id, device_id, android_id"))
+        assertFalse(executedQueries.any { it.first.startsWith("INSERT INTO crm_users") })
+        assertTrue(executedQueries.any { it.first.startsWith("UPDATE crm_users") })
+        assertEquals(1, storedUsers.size)
+        assertEquals("5.6.7.8", storedUsers["USR-IMMUTABLE01"]!!["public_ip"])
+        assertEquals("hw_android_id_777", storedUsers["USR-IMMUTABLE01"]!!["device_id"])
     }
 }

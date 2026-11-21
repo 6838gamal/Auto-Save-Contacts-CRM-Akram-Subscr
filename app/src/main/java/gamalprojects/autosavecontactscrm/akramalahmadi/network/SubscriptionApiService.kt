@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit
 @JsonClass(generateAdapter = true)
 data class SubscriptionConnectRequest(
     @Json(name = "user_id") val userId: String,
+    @Json(name = "device_id") val deviceId: String = "",
     @Json(name = "android_id") val androidId: String,
     @Json(name = "install_uuid") val installUuid: String,
     @Json(name = "public_ip") val publicIp: String,
@@ -38,6 +39,7 @@ data class SubscriptionConnectRequest(
 data class SubscriptionActivateRequest(
     @Json(name = "code") val code: String,
     @Json(name = "user_id") val userId: String,
+    @Json(name = "device_id") val deviceId: String = "",
     @Json(name = "android_id") val androidId: String,
     @Json(name = "install_uuid") val installUuid: String,
     @Json(name = "public_ip") val publicIp: String,
@@ -54,6 +56,7 @@ data class SubscriptionActivateRequest(
 data class SubscriptionVerifyRequest(
     @Json(name = "code") val code: String,
     @Json(name = "user_id") val userId: String,
+    @Json(name = "device_id") val deviceId: String = "",
     @Json(name = "android_id") val androidId: String,
     @Json(name = "public_ip") val publicIp: String,
     @Json(name = "local_ip") val localIp: String,
@@ -66,6 +69,7 @@ data class SubscriptionVerifyRequest(
 data class SubscriptionUsageRequest(
     @Json(name = "code") val code: String,
     @Json(name = "user_id") val userId: String,
+    @Json(name = "device_id") val deviceId: String = "",
     @Json(name = "public_ip") val publicIp: String,
     @Json(name = "used_contacts") val usedContacts: Int,
     @Json(name = "total_contacts") val totalContacts: Int,
@@ -75,6 +79,7 @@ data class SubscriptionUsageRequest(
 @JsonClass(generateAdapter = true)
 data class SubscriptionReviewRequest(
     @Json(name = "user_id") val userId: String,
+    @Json(name = "device_id") val deviceId: String = "",
     @Json(name = "requested_code") val requestedCode: String = "",
     @Json(name = "public_ip") val publicIp: String,
     @Json(name = "local_ip") val localIp: String,
@@ -100,6 +105,7 @@ data class ClientSyncItem(
 @JsonClass(generateAdapter = true)
 data class ClientSyncBatchRequest(
     @Json(name = "user_id") val userId: String,
+    @Json(name = "device_id") val deviceId: String = "",
     @Json(name = "public_ip") val publicIp: String,
     @Json(name = "plan_type") val planType: String = "FREE",
     @Json(name = "clients") val clients: List<ClientSyncItem>

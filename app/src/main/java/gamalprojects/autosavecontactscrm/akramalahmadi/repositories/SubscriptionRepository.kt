@@ -151,6 +151,7 @@ class SubscriptionRepository(
 
     private fun resolvePostgresGateway(): PostgresSubscriptionGateway? {
         if (postgresGatewayOverride != null) return postgresGatewayOverride
+        if (apiServiceOverride != null) return null
         val cfg = PostgresConnectionConfig.parse(BuildConfig.DATABASE_URL) ?: return null
         return PostgresSubscriptionGateway(cfg)
     }
@@ -454,6 +455,24 @@ class SubscriptionRepository(
             )
             val dbStatus = DbConnectionStatus.Connected(connectOutcome.message)
 
+            // Reconcile free-tier state from database if the device already had usage recorded (e.g. after reinstall)
+            val reconciledUsed = maxOf(freeState.usedContacts, connectOutcome.serverFreeUsed)
+            val reconciledExhausted = freeState.isExhausted ||
+                connectOutcome.serverFreeExhausted ||
+                reconciledUsed >= FREE_CONTACTS_LIMIT
+            if (reconciledUsed > freeState.usedContacts) {
+                settingDao.insertSetting(SettingEntity(KEY_FREE_USED, reconciledUsed.toString()))
+            }
+            if (reconciledExhausted && !freeState.isExhausted) {
+                settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, MSG_FREE_LIMIT_REACHED))
+            }
+            val effectiveFreeState = FreeAccessState(
+                usedContacts = reconciledUsed,
+                limit = FREE_CONTACTS_LIMIT,
+                isExhausted = reconciledExhausted
+            )
+
             if (!activeCodeKey.isNullOrBlank()) {
                 val verifiedBody = gateway.verifySession(
                     code = activeCodeKey,
@@ -464,30 +483,30 @@ class SubscriptionRepository(
                 val failureReason = validateApiStatusFlags(verifiedBody, cachedUsedQuota)
                 if (failureReason == null) {
                     val info = persistActiveSubscription(activeCodeKey, verifiedBody, snapshot, existingUsed = cachedUsedQuota)
-                    SessionVerifyOutcome(info, freeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
+                    SessionVerifyOutcome(info, effectiveFreeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
                 } else {
                     settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
                     settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
                     settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, failureReason))
                     upsertUserProfile(snapshot, activeCode = null)
-                    SessionVerifyOutcome(null, freeState, isAllowed = false, dbStatus = dbStatus, errorMessage = failureReason, isConnectionError = false)
+                    SessionVerifyOutcome(null, effectiveFreeState, isAllowed = false, dbStatus = dbStatus, errorMessage = failureReason, isConnectionError = false)
                 }
             } else {
-                // Check if admin approved a subscription for this user_id directly in PostgreSQL
+                // Check if admin approved a subscription for this device directly in PostgreSQL
                 val approved = connectOutcome.activeSubscription
                 val failure = if (approved != null) validateApiStatusFlags(approved, 0) else null
                 if (approved != null && failure == null) {
                     settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
                     val info = persistActiveSubscription(approved.code, approved, snapshot, existingUsed = approved.usedContacts)
-                    return SessionVerifyOutcome(info, freeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
+                    return SessionVerifyOutcome(info, effectiveFreeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
                 }
 
-                if (!freeState.isExhausted && !explicitlyLocked) {
-                    SessionVerifyOutcome(null, freeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
+                if (!effectiveFreeState.isExhausted && !explicitlyLocked) {
+                    SessionVerifyOutcome(null, effectiveFreeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
                 } else {
                     val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
                         ?: MSG_FREE_LIMIT_REACHED
-                    SessionVerifyOutcome(null, freeState, isAllowed = false, dbStatus = dbStatus, errorMessage = reason, isConnectionError = false)
+                    SessionVerifyOutcome(null, effectiveFreeState, isAllowed = false, dbStatus = dbStatus, errorMessage = reason, isConnectionError = false)
                 }
             }
         } catch (e: CancellationException) {
@@ -516,6 +535,7 @@ class SubscriptionRepository(
                     apiKey = apiKeyHeader,
                     request = SubscriptionConnectRequest(
                         userId = snapshot.userId,
+                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
                         androidId = snapshot.androidId,
                         installUuid = snapshot.installUuid,
                         publicIp = snapshot.publicIp,
@@ -572,6 +592,7 @@ class SubscriptionRepository(
                 request = SubscriptionVerifyRequest(
                     code = activeCodeKey,
                     userId = snapshot.userId,
+                    deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
                     androidId = snapshot.androidId,
                     publicIp = snapshot.publicIp,
                     localIp = snapshot.localIp,
@@ -679,6 +700,7 @@ class SubscriptionRepository(
                     apiKey = apiKeyHeader,
                     request = SubscriptionConnectRequest(
                         userId = snapshot.userId,
+                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
                         androidId = snapshot.androidId,
                         installUuid = snapshot.installUuid,
                         publicIp = snapshot.publicIp,
@@ -761,6 +783,7 @@ class SubscriptionRepository(
                     request = SubscriptionActivateRequest(
                         code = code,
                         userId = snapshot.userId,
+                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
                         androidId = snapshot.androidId,
                         installUuid = snapshot.installUuid,
                         publicIp = snapshot.publicIp,
@@ -854,6 +877,7 @@ class SubscriptionRepository(
                     apiKey = apiKeyHeader,
                     request = SubscriptionReviewRequest(
                         userId = snapshot.userId,
+                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
                         requestedCode = cleanCode,
                         publicIp = snapshot.publicIp,
                         localIp = snapshot.localIp,
@@ -993,6 +1017,7 @@ class SubscriptionRepository(
                 apiKey = apiKeyHeader,
                 request = SubscriptionConnectRequest(
                     userId = snapshot.userId,
+                    deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
                     androidId = snapshot.androidId,
                     installUuid = snapshot.installUuid,
                     publicIp = snapshot.publicIp,
@@ -1038,6 +1063,7 @@ class SubscriptionRepository(
                 request = SubscriptionUsageRequest(
                     code = code,
                     userId = snapshot.userId,
+                    deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
                     publicIp = snapshot.publicIp,
                     usedContacts = usedCount,
                     totalContacts = totalContacts,
@@ -1082,12 +1108,13 @@ class SubscriptionRepository(
 
         val item = contact.toClientSyncItem(isDeleted = isDeleted)
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val deviceId = UserIdentityManager.getImmutableDeviceId(snapshot)
         val planType = resolveCurrentPlanType()
 
         val pgGateway = resolvePostgresGateway()
         if (pgGateway != null) {
             return@withContext try {
-                pgGateway.syncClientsBatch(snapshot.userId, listOf(item), planType = planType)
+                pgGateway.syncClientsBatch(snapshot.userId, listOf(item), planType = planType, deviceId = deviceId)
                 if (isDeleted) {
                     unmarkPendingClientDeleted(contact.phone)
                 }
@@ -1107,6 +1134,7 @@ class SubscriptionRepository(
                 apiKey = apiKeyHeader,
                 request = ClientSyncBatchRequest(
                     userId = snapshot.userId,
+                    deviceId = deviceId,
                     publicIp = snapshot.publicIp,
                     planType = planType,
                     clients = listOf(item)
@@ -1143,10 +1171,11 @@ class SubscriptionRepository(
         if (items.isEmpty()) return@withContext true
 
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val deviceId = UserIdentityManager.getImmutableDeviceId(snapshot)
         val planType = resolveCurrentPlanType()
         if (pgGateway != null) {
             return@withContext try {
-                pgGateway.syncClientsBatch(snapshot.userId, items, planType = planType)
+                pgGateway.syncClientsBatch(snapshot.userId, items, planType = planType, deviceId = deviceId)
                 if (pendingDeletes.isNotEmpty()) {
                     savePendingDeletedClients(emptyList())
                 }
@@ -1165,6 +1194,7 @@ class SubscriptionRepository(
                 apiKey = apiKeyHeader,
                 request = ClientSyncBatchRequest(
                     userId = snapshot.userId,
+                    deviceId = deviceId,
                     publicIp = snapshot.publicIp,
                     planType = planType,
                     clients = items

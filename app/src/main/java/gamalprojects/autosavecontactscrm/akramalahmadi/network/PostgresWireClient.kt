@@ -138,6 +138,12 @@ data class PostgresQueryResult(
 
 class PostgresException(message: String, val sqlState: String? = null) : IOException(message)
 
+interface PostgresSqlExecutor : AutoCloseable {
+    fun connect()
+    fun executeSimple(sql: String): PostgresQueryResult
+    fun query(sql: String, params: List<String?> = emptyList()): PostgresQueryResult
+}
+
 /**
  * Lightweight, Android-safe PostgreSQL Wire Protocol v3.0 client.
  * Supports TCP + TLS (SSLRequest), Cleartext, MD5, SCRAM-SHA-256 authentication,
@@ -146,13 +152,13 @@ class PostgresException(message: String, val sqlState: String? = null) : IOExcep
 class PostgresWireClient(
     private val config: PostgresConnectionConfig,
     private val timeoutMs: Int = 5_000
-) : AutoCloseable {
+) : PostgresSqlExecutor {
 
     private var socket: Socket? = null
     private lateinit var input: DataInputStream
     private lateinit var output: DataOutputStream
 
-    fun connect() {
+    override fun connect() {
         val rawSocket = Socket()
         rawSocket.soTimeout = timeoutMs
         rawSocket.connect(InetSocketAddress(config.host, config.port), timeoutMs)
@@ -200,7 +206,7 @@ class PostgresWireClient(
         authenticateAndWaitReady()
     }
 
-    fun executeSimple(sql: String): PostgresQueryResult {
+    override fun executeSimple(sql: String): PostgresQueryResult {
         ensureConnected()
         val sqlBytes = sql.toByteArray(StandardCharsets.UTF_8)
         output.writeByte('Q'.code)
@@ -211,7 +217,7 @@ class PostgresWireClient(
         return readUntilReadyForQuery()
     }
 
-    fun query(sql: String, params: List<String?> = emptyList()): PostgresQueryResult {
+    override fun query(sql: String, params: List<String?>): PostgresQueryResult {
         ensureConnected()
         val sqlBytes = sql.toByteArray(StandardCharsets.UTF_8)
 
