@@ -41,9 +41,6 @@ interface LogEntryDao {
     @Query("SELECT * FROM logs_table ORDER BY timestamp DESC")
     fun getAllLogs(): Flow<List<LogEntry>>
 
-    @Query("SELECT COUNT(*) FROM logs_table")
-    suspend fun getLogsCountSync(): Int
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLog(log: LogEntry)
 

@@ -4,8 +4,6 @@ import com.squareup.moshi.Json
 import com.squareup.moshi.JsonClass
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
-import okio.Buffer
 import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
@@ -150,17 +148,6 @@ data class ServerEndpointConfig(
         }
     }
 }
-
-data class NetworkExchangeCapture(
-    val baseUrl: String,
-    val sanitizedEndpointUrl: String,
-    val authParamName: String?,
-    val httpCode: Int?,
-    val latencyMs: Long?,
-    val rawResponseBody: String?,
-    val errorDetail: String?,
-    val timestamp: Long = System.currentTimeMillis()
-)
 
 @JsonClass(generateAdapter = true)
 data class SubscriptionConnectRequest(
@@ -335,16 +322,6 @@ interface SubscriptionApiService {
         @Volatile
         private var cachedService: SubscriptionApiService? = null
 
-        @Volatile
-        var lastNetworkExchange: NetworkExchangeCapture? = null
-            private set
-
-        fun sanitizeUrlToken(raw: String, token: String?): String {
-            if (token.isNullOrBlank()) return raw
-            val masked = if (token.length <= 2) "***" else "${token.take(2)}***"
-            return raw.replace("=$token", "=$masked")
-        }
-
         fun extractApiKey(databaseUrl: String): String? {
             return ServerEndpointConfig.parse(databaseUrl)?.authToken
         }
@@ -359,20 +336,10 @@ interface SubscriptionApiService {
 
             val invalidReason = ServerEndpointConfig.isPlaceholderOrInvalidScheme(trimmed)
             if (invalidReason != null) {
-                ApiDebugLogger.logCreateFailure(invalidReason)
                 return null
             }
 
-            val endpoint = ServerEndpointConfig.parse(trimmed)
-            if (endpoint == null) {
-                ApiDebugLogger.logCreateFailure("تعذر تحليل رابط الخادم: $trimmed")
-                return null
-            }
-
-            ApiDebugLogger.log(
-                "CREATE",
-                "إنشاء عميل الخادم: baseUrl=${endpoint.baseUrl} | authParam=${endpoint.authParamName ?: "none"}"
-            )
+            val endpoint = ServerEndpointConfig.parse(trimmed) ?: return null
 
             return try {
                 // Inject extracted server token on every request (headers + original query param if present)
@@ -403,80 +370,6 @@ interface SubscriptionApiService {
                     chain.proceed(builder.build())
                 }
 
-                val auditInterceptor = Interceptor { chain ->
-                    val request = chain.request()
-                    val endpointUrl = request.url.toString()
-                    val method = request.method
-
-                    val headers = mutableMapOf<String, String?>()
-                    request.headers.names().forEach { name ->
-                        headers[name] = request.header(name)
-                    }
-
-                    val bodyText = try {
-                        val buffer = Buffer()
-                        request.body?.writeTo(buffer)
-                        buffer.readUtf8().take(4000)
-                    } catch (_: Exception) {
-                        null
-                    }
-
-                    ApiDebugLogger.logRequest(endpointUrl, method, bodyText, headers)
-
-                    val start = System.currentTimeMillis()
-                    try {
-                        val response = chain.proceed(request)
-                        val elapsed = System.currentTimeMillis() - start
-
-                        val responseBody = try {
-                            response.peekBody(8000).string()
-                        } catch (_: Exception) {
-                            null
-                        }
-
-                        ApiDebugLogger.logResponse(endpointUrl, response.code, responseBody)
-                        ApiDebugLogger.log("TIMING", "$endpointUrl استغرق ${elapsed}ms")
-
-                        lastNetworkExchange = NetworkExchangeCapture(
-                            baseUrl = endpoint.baseUrl,
-                            sanitizedEndpointUrl = sanitizeUrlToken(endpointUrl, endpoint.authToken),
-                            authParamName = endpoint.authParamName,
-                            httpCode = response.code,
-                            latencyMs = elapsed,
-                            rawResponseBody = responseBody,
-                            errorDetail = if (response.isSuccessful) null else "HTTP ${response.code}"
-                        )
-
-                        when (response.code) {
-                            401, 403 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ ${response.code}: مصادقة فاشلة. تحقق من مفتاح الخادم.")
-                            404 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ 404: المسار غير موجود ($endpointUrl).")
-                            405 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ 405: الطريقة غير مسموحة (المتوقع POST).")
-                            500, 502, 503, 504 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ ${response.code}: خطأ أو تهيئة في الخادم.")
-                            in 200..299 -> ApiDebugLogger.log("DIAGNOSIS", "✅ ${response.code}: نجح الطلب.")
-                        }
-                        response
-                    } catch (e: Exception) {
-                        val elapsed = System.currentTimeMillis() - start
-                        lastNetworkExchange = NetworkExchangeCapture(
-                            baseUrl = endpoint.baseUrl,
-                            sanitizedEndpointUrl = sanitizeUrlToken(endpointUrl, endpoint.authToken),
-                            authParamName = endpoint.authParamName,
-                            httpCode = null,
-                            latencyMs = elapsed,
-                            rawResponseBody = null,
-                            errorDetail = "${e.javaClass.simpleName}: ${e.message ?: "تعذر الاتصال"}"
-                        )
-                        ApiDebugLogger.logFailure(endpointUrl, e)
-                        throw e
-                    }
-                }
-
-                val logging = HttpLoggingInterceptor { msg ->
-                    ApiDebugLogger.log("OKHTTP", msg)
-                }.apply {
-                    level = HttpLoggingInterceptor.Level.BASIC
-                }
-
                 // Generous timeouts to support Render cold-start wakeups without blocking UI
                 val client = OkHttpClient.Builder()
                     .connectTimeout(20, TimeUnit.SECONDS)
@@ -484,8 +377,6 @@ interface SubscriptionApiService {
                     .writeTimeout(30, TimeUnit.SECONDS)
                     .callTimeout(45, TimeUnit.SECONDS)
                     .addInterceptor(authInterceptor)
-                    .addInterceptor(auditInterceptor)
-                    .addInterceptor(logging)
                     .build()
 
                 val service = Retrofit.Builder()
@@ -500,14 +391,8 @@ interface SubscriptionApiService {
                     cachedService = service
                 }
 
-                ApiDebugLogger.logCreateSuccess(endpoint.baseUrl, endpoint.authToken != null)
                 service
-            } catch (e: Exception) {
-                ApiDebugLogger.logError(
-                    "CREATE_FAIL",
-                    "استثناء أثناء إنشاء عميل الخادم: ${e.javaClass.simpleName}: ${e.message}",
-                    e
-                )
+            } catch (_: Exception) {
                 null
             }
         }

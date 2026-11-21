@@ -13,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.animation.*
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -32,9 +33,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -138,24 +141,6 @@ fun AutoSaveCrmApp(
                         )
                     }
                 }
-
-                val showConnectionDialog by subscriptionViewModel.showConnectionDialog.collectAsStateWithLifecycle()
-                val connectionReport by subscriptionViewModel.connectionReport.collectAsStateWithLifecycle()
-                val isRefreshingConnection by subscriptionViewModel.isRefreshingIdentity.collectAsStateWithLifecycle()
-                val activeReport = connectionReport
-                if (showConnectionDialog && activeReport != null && currentScreen != Screen.SPLASH) {
-                    ConnectionDetailsPopupDialog(
-                        report = activeReport,
-                        isRefreshing = isRefreshingConnection,
-                        onRetrySync = {
-                            subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
-                                viewModel.navigateTo(Screen.DASHBOARD)
-                                viewModel.tryStartMonitoringAutomatically()
-                            })
-                        },
-                        onDismiss = { subscriptionViewModel.dismissConnectionDetailsDialog() }
-                    )
-                }
             }
         )
     }
@@ -185,19 +170,21 @@ fun SplashScreen(onFinished: () -> Unit) {
             verticalArrangement = Arrangement.Center,
             modifier = Modifier.padding(24.dp)
         ) {
-            Box(
+            Surface(
                 modifier = Modifier
-                    .size(110.dp)
-                    .clip(RoundedCornerShape(24.dp))
-                    .border(2.dp, Color(0xFF10B981), RoundedCornerShape(24.dp))
-                    .background(Color(0xFF1E293B)),
-                contentAlignment = Alignment.Center
+                    .size(164.dp)
+                    .border(2.dp, Color(0xFF10B981), RoundedCornerShape(28.dp)),
+                shape = RoundedCornerShape(28.dp),
+                color = Color.White,
+                shadowElevation = 8.dp
             ) {
-                Icon(
-                    imageVector = Icons.Filled.ContactPhone,
-                    contentDescription = "CRM App Icon",
-                    tint = Color(0xFF10B981),
-                    modifier = Modifier.size(64.dp)
+                Image(
+                    painter = painterResource(id = R.drawable.brand_logo),
+                    contentDescription = stringResource(id = R.string.brand_logo_desc),
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(8.dp)
                 )
             }
             
@@ -274,12 +261,21 @@ fun AppNavigationDrawer(
                         .padding(horizontal = 20.dp, vertical = 32.dp)
                 ) {
                     Column {
-                        Icon(
-                            imageVector = Icons.Filled.ContactPhone,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(52.dp)
-                        )
+                        Surface(
+                            modifier = Modifier.size(100.dp),
+                            shape = RoundedCornerShape(18.dp),
+                            color = Color.White,
+                            shadowElevation = 4.dp
+                        ) {
+                            Image(
+                                painter = painterResource(id = R.drawable.brand_logo),
+                                contentDescription = stringResource(id = R.string.brand_logo_desc),
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(6.dp)
+                            )
+                        }
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
                             text = stringResource(id = R.string.app_name),
@@ -550,12 +546,9 @@ fun DashboardScreen(
                     dbStatus = dbStatus,
                     isBusy = isRefreshingDb,
                     onRetrySync = {
-                        subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
+                        subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
                             Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         })
-                    },
-                    onShowDetails = {
-                        subscriptionViewModel.openConnectionDetailsDialog()
                     }
                 )
             }
@@ -1436,12 +1429,9 @@ fun SettingsScreen(
                     dbStatus = dbStatus,
                     isBusy = isRefreshingDb,
                     onRetrySync = {
-                        subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
+                        subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
                             Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         })
-                    },
-                    onShowDetails = {
-                        subscriptionViewModel.openConnectionDetailsDialog()
                     }
                 )
             }

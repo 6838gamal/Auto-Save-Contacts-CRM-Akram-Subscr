@@ -41,12 +41,6 @@
             </intent-filter>
         </activity>
 
-        <!-- شاشة التشخيص — مؤقتة -->
-        <activity
-            android:name=".network.DebugConsoleActivity"
-            android:exported="false"
-            android:label="Debug Console" />
-
         <!-- Foreground Monitoring Service -->
         <service
             android:name=".services.AutoSaveForegroundService"

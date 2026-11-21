@@ -1021,12 +1021,6 @@ class SubscriptionManagerTest {
         val err404Outcome = repo.verifyCurrentSession(context)
         assertTrue(err404Outcome.dbStatus is DbConnectionStatus.Disconnected)
         assertTrue(err404Outcome.isAllowed) // free tier <= 100 still allowed while disconnected
-        val errReport = err404Outcome.connectionReport
-        assertNotNull(errReport)
-        assertFalse(errReport!!.succeeded)
-        assertEquals(404, errReport.httpStatusCode)
-        assertEquals(1, errReport.localContactsCount)
-        assertEquals("عميل اختباري", errReport.sampleContacts.first().name)
 
         // 2. Server returns 200 OK with prior server-recorded free_tier_exhausted = true for this immutable device_id
         serverHttpCode = 200
@@ -1038,15 +1032,5 @@ class SubscriptionManagerTest {
         assertTrue(syncedOutcome.freeAccessState.isExhausted)
         assertFalse(syncedOutcome.isAllowed)
         assertFalse(repo.canSaveNewContact())
-
-        val okReport = syncedOutcome.connectionReport
-        assertNotNull(okReport)
-        assertTrue(okReport!!.succeeded)
-        assertEquals(200, okReport.httpStatusCode)
-        assertEquals(true, okReport.clientsSyncSucceeded)
-        assertEquals(100, okReport.freeContactsUsed)
-        assertTrue(okReport.freeTierExhausted)
-        assertEquals(1, okReport.localContactsCount)
-        assertTrue(okReport.rawServerResponse.contains("free_contacts_used"))
     }
 }

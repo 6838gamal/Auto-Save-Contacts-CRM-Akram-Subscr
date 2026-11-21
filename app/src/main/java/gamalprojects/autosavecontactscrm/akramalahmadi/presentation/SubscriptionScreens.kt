@@ -16,7 +16,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -331,13 +330,10 @@ fun SubscriptionGateScreen(
                 dbStatus = dbStatus,
                 isBusy = isRefreshing || isVerifying,
                 onRetrySync = {
-                    subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
+                    subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
                         Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         onUnlocked()
                     })
-                },
-                onShowDetails = {
-                    subscriptionViewModel.openConnectionDetailsDialog()
                 }
             )
 
@@ -813,8 +809,7 @@ fun SubscriptionGateScreen(
 fun ServerConnectionBadgeCard(
     dbStatus: DbConnectionStatus,
     isBusy: Boolean,
-    onRetrySync: () -> Unit,
-    onShowDetails: (() -> Unit)? = null
+    onRetrySync: () -> Unit
 ) {
     val (bgColor, accentColor, icon, title, subtitle) = when (dbStatus) {
         is DbConnectionStatus.Checking -> Tuple5(
@@ -829,7 +824,7 @@ fun ServerConnectionBadgeCard(
             Color(0xFF10B981),
             Icons.Filled.CloudDone,
             "حالة الاتصال: متصل",
-            if (onShowDetails != null) "اضغط لعرض تفاصيل الاتصال ومحتوى قاعدة البيانات" else null
+            null
         )
         is DbConnectionStatus.Disconnected,
         is DbConnectionStatus.NotConfigured -> Tuple5(
@@ -837,7 +832,7 @@ fun ServerConnectionBadgeCard(
             Color(0xFFF59E0B),
             Icons.Filled.CloudOff,
             "حالة الاتصال: غير متصل",
-            "تواصل مع الإدارة لمراجعة الأمر (${SubscriptionRepository.ADMIN_PHONE_DISPLAY}) • اضغط للتفاصيل"
+            "تواصل مع الإدارة لمراجعة الأمر (${SubscriptionRepository.ADMIN_PHONE_DISPLAY})"
         )
     }
 
@@ -847,13 +842,6 @@ fun ServerConnectionBadgeCard(
         modifier = Modifier
             .fillMaxWidth()
             .border(1.dp, accentColor.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-            .then(
-                if (onShowDetails != null) {
-                    Modifier.clickable { onShowDetails() }
-                } else {
-                    Modifier
-                }
-            )
             .testTag("server_connection_status_card")
     ) {
         Row(
@@ -897,21 +885,6 @@ fun ServerConnectionBadgeCard(
                         fontSize = 10.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f),
                         lineHeight = 14.sp
-                    )
-                }
-            }
-            if (onShowDetails != null) {
-                IconButton(
-                    onClick = onShowDetails,
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .testTag("show_connection_details_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Info,
-                        contentDescription = "عرض تفاصيل الاتصال",
-                        tint = accentColor,
-                        modifier = Modifier.size(18.dp)
                     )
                 }
             }

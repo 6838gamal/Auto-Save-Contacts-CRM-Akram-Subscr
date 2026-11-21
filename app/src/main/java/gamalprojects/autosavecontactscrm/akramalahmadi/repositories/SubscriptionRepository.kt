@@ -9,11 +9,8 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.database.SubscriptionCode
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.UserDeviceProfileEntity
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityManager
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserNetworkSnapshot
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.ApiDebugLogger
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncBatchRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncItem
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.NetworkExchangeCapture
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.ServerEndpointConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionActivateRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiResponse
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiService
@@ -100,48 +97,13 @@ data class FreeAccessState(
     val remainingContacts: Int get() = (limit - usedContacts).coerceAtLeast(0)
 }
 
-data class ConnectionDetailsReport(
-    val succeeded: Boolean,
-    val statusHeadline: String,
-    val statusDetail: String,
-    val connectedWithTarget: String,
-    val authMethodSummary: String,
-    val httpStatusCode: Int?,
-    val latencyMs: Long?,
-    val errorDetail: String?,
-    val networkType: String,
-    val deviceId: String,
-    val userId: String,
-    val publicIp: String,
-    val localIp: String,
-    val planType: String,
-    val freeContactsUsed: Int,
-    val freeContactsLimit: Int,
-    val freeTierExhausted: Boolean,
-    val isSubscribed: Boolean,
-    val isSubscriptionActive: Boolean,
-    val activeCode: String?,
-    val serverStatusText: String,
-    val serverMessageText: String,
-    val rawServerResponse: String,
-    val clientsSyncSucceeded: Boolean?,
-    val clientsSyncResponse: String?,
-    val localContactsCount: Int,
-    val syncedToPhoneCount: Int,
-    val localLogsCount: Int,
-    val pendingDeletesCount: Int,
-    val sampleContacts: List<Contact>,
-    val capturedAt: Long = System.currentTimeMillis()
-)
-
 data class SessionVerifyOutcome(
     val activeInfo: ActiveSubscriptionInfo?,
     val freeAccessState: FreeAccessState,
     val isAllowed: Boolean,
     val dbStatus: DbConnectionStatus,
     val errorMessage: String?,
-    val isConnectionError: Boolean,
-    val connectionReport: ConnectionDetailsReport? = null
+    val isConnectionError: Boolean
 )
 
 data class LocalAccessDecision(
@@ -181,7 +143,6 @@ class SubscriptionRepository(
     private val profileDao = db.userDeviceProfileDao()
     private val settingDao = db.settingDao()
     private val contactDao = db.contactDao()
-    private val logDao = db.logEntryDao()
 
     fun isDatabaseConfigured(): Boolean = resolveApiService() != null
 
@@ -385,7 +346,7 @@ class SubscriptionRepository(
 
         val api = resolveApiService()
         if (api != null) {
-            val serverCapture = verifyViaServerApi(
+            val outcome = verifyViaServerApi(
                 api = api,
                 snapshot = snapshot,
                 freeState = freeState,
@@ -394,35 +355,19 @@ class SubscriptionRepository(
                 cachedCode = cached,
                 explicitlyLocked = explicitlyLocked
             )
-            val authExchange = SubscriptionApiService.lastNetworkExchange
-            var clientsSyncOk: Boolean? = null
-            var clientsSyncExchange: NetworkExchangeCapture? = null
-            if (serverCapture.outcome.dbStatus is DbConnectionStatus.Connected) {
-                clientsSyncOk = syncAllClientsToDatabase(context)
-                clientsSyncExchange = SubscriptionApiService.lastNetworkExchange
+            if (outcome.dbStatus is DbConnectionStatus.Connected) {
+                syncAllClientsToDatabase(context)
             }
-            val report = buildConnectionDetailsReport(
-                snapshot = snapshot,
-                outcome = serverCapture.outcome,
-                apiResponse = serverCapture.apiResponse,
-                explicitHttpCode = serverCapture.httpCode,
-                explicitError = serverCapture.errorDetail,
-                authExchange = authExchange,
-                clientsSyncSucceeded = clientsSyncOk,
-                clientsSyncExchange = clientsSyncExchange
-            )
-            return@withContext serverCapture.outcome.copy(connectionReport = report)
+            return@withContext outcome
         }
 
         // Server not configured yet: allow free usage up to 100 or valid cached code, prompt to contact owner
-        ApiDebugLogger.logWarn("REPO", "الخادم غير مربوط أو الرابط غير صالح — التشغيل في الوضع المحلي.")
-        val configInvalidReason = ServerEndpointConfig.isPlaceholderOrInvalidScheme(BuildConfig.DATABASE_URL)
         val notConfiguredStatus = DbConnectionStatus.NotConfigured(MSG_DB_NOT_CONFIGURED)
-        val rawOutcome = if (!activeCodeKey.isNullOrBlank()) {
+        if (!activeCodeKey.isNullOrBlank()) {
             if (cached != null && cached.isActive && cached.isSubscribed &&
                 (cached.boundUserId.isNullOrBlank() || cached.boundUserId == snapshot.userId)
             ) {
-                SessionVerifyOutcome(
+                return@withContext SessionVerifyOutcome(
                     activeInfo = cached.toActiveInfo(snapshot),
                     freeAccessState = freeState,
                     isAllowed = true,
@@ -430,18 +375,19 @@ class SubscriptionRepository(
                     errorMessage = null,
                     isConnectionError = false
                 )
-            } else {
-                SessionVerifyOutcome(
-                    activeInfo = null,
-                    freeAccessState = freeState,
-                    isAllowed = !freeState.isExhausted && !explicitlyLocked,
-                    dbStatus = notConfiguredStatus,
-                    errorMessage = if (!freeState.isExhausted && !explicitlyLocked) null else MSG_DB_NOT_CONFIGURED,
-                    isConnectionError = true
-                )
             }
-        } else if (!freeState.isExhausted && !explicitlyLocked) {
-            SessionVerifyOutcome(
+            return@withContext SessionVerifyOutcome(
+                activeInfo = null,
+                freeAccessState = freeState,
+                isAllowed = !freeState.isExhausted && !explicitlyLocked,
+                dbStatus = notConfiguredStatus,
+                errorMessage = if (!freeState.isExhausted && !explicitlyLocked) null else MSG_DB_NOT_CONFIGURED,
+                isConnectionError = true
+            )
+        }
+
+        if (!freeState.isExhausted && !explicitlyLocked) {
+            return@withContext SessionVerifyOutcome(
                 activeInfo = null,
                 freeAccessState = freeState,
                 isAllowed = true,
@@ -449,37 +395,19 @@ class SubscriptionRepository(
                 errorMessage = null,
                 isConnectionError = false
             )
-        } else {
-            val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
-                ?: if (freeState.isExhausted) MSG_FREE_LIMIT_REACHED else null
-            SessionVerifyOutcome(
-                activeInfo = null,
-                freeAccessState = freeState,
-                isAllowed = false,
-                dbStatus = notConfiguredStatus,
-                errorMessage = reason,
-                isConnectionError = false
-            )
         }
-        val report = buildConnectionDetailsReport(
-            snapshot = snapshot,
-            outcome = rawOutcome,
-            apiResponse = null,
-            explicitHttpCode = null,
-            explicitError = configInvalidReason ?: "رابط الخادم غير مضبوط في متغيرات البيئة",
-            authExchange = null,
-            clientsSyncSucceeded = null,
-            clientsSyncExchange = null
-        )
-        return@withContext rawOutcome.copy(connectionReport = report)
-    }
 
-    private data class ServerVerifyInternalResult(
-        val outcome: SessionVerifyOutcome,
-        val apiResponse: SubscriptionApiResponse? = null,
-        val httpCode: Int? = null,
-        val errorDetail: String? = null
-    )
+        val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
+            ?: if (freeState.isExhausted) MSG_FREE_LIMIT_REACHED else null
+        return@withContext SessionVerifyOutcome(
+            activeInfo = null,
+            freeAccessState = freeState,
+            isAllowed = false,
+            dbStatus = notConfiguredStatus,
+            errorMessage = reason,
+            isConnectionError = false
+        )
+    }
 
     private suspend fun verifyViaServerApi(
         api: SubscriptionApiService,
@@ -489,7 +417,7 @@ class SubscriptionRepository(
         activeCodeKey: String?,
         cachedCode: SubscriptionCodeEntity?,
         explicitlyLocked: Boolean
-    ): ServerVerifyInternalResult {
+    ): SessionVerifyOutcome {
         val cachedUsedQuota = cachedCode?.usedContacts ?: 0
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
         val deviceId = UserIdentityManager.getImmutableDeviceId(snapshot)
@@ -527,11 +455,6 @@ class SubscriptionRepository(
 
             val connectSucceeded = connectResp?.isSuccessful == true
             val connectBody = if (connectSucceeded) connectResp?.body() else null
-            val connectErrText = if (!connectSucceeded && connectResp != null) {
-                "HTTP ${connectResp.code()}: ${extractErrorMessage(connectResp.errorBody()?.string()) ?: connectResp.message()}"
-            } else {
-                null
-            }
 
             // Reconcile server-stored free usage if the server recognizes this immutable device after reinstall
             val serverFreeUsed = connectBody?.freeContactsUsed ?: 0
@@ -562,12 +485,7 @@ class SubscriptionRepository(
 
             if (activeCodeKey.isNullOrBlank()) {
                 if (!connectSucceeded) {
-                    return ServerVerifyInternalResult(
-                        outcome = offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked),
-                        apiResponse = null,
-                        httpCode = connectResp?.code(),
-                        errorDetail = connectErrText
-                    )
+                    return offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked)
                 }
 
                 val dbStatus = DbConnectionStatus.Connected("متصل")
@@ -576,27 +494,15 @@ class SubscriptionRepository(
                     if (failure == null) {
                         settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
                         val info = persistActiveSubscription(connectBody.code, connectBody, snapshot, existingUsed = connectBody.usedContacts)
-                        return ServerVerifyInternalResult(
-                            outcome = SessionVerifyOutcome(info, effectiveFreeState, true, dbStatus, null, false),
-                            apiResponse = connectBody,
-                            httpCode = connectResp.code(),
-                            errorDetail = null
-                        )
+                        return SessionVerifyOutcome(info, effectiveFreeState, true, dbStatus, null, false)
                     }
                 }
-                val outcome = if (!effectiveFreeState.isExhausted && !explicitlyLocked) {
-                    SessionVerifyOutcome(null, effectiveFreeState, true, dbStatus, null, false)
-                } else {
-                    val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
-                        ?: MSG_FREE_LIMIT_REACHED
-                    SessionVerifyOutcome(null, effectiveFreeState, false, dbStatus, reason, false)
+                if (!effectiveFreeState.isExhausted && !explicitlyLocked) {
+                    return SessionVerifyOutcome(null, effectiveFreeState, true, dbStatus, null, false)
                 }
-                return ServerVerifyInternalResult(
-                    outcome = outcome,
-                    apiResponse = connectBody,
-                    httpCode = connectResp.code(),
-                    errorDetail = null
-                )
+                val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
+                    ?: MSG_FREE_LIMIT_REACHED
+                return SessionVerifyOutcome(null, effectiveFreeState, false, dbStatus, reason, false)
             }
 
             val response = api.verifySession(
@@ -619,7 +525,7 @@ class SubscriptionRepository(
                 val body = response.body()
                 val failureReason = validateApiStatusFlags(body, cachedUsedQuota)
                 val connectedStatus = DbConnectionStatus.Connected("متصل")
-                val outcome = if (body != null && failureReason == null) {
+                if (body != null && failureReason == null) {
                     settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "0"))
                     val info = persistActiveSubscription(activeCodeKey, body, snapshot, existingUsed = cachedUsedQuota)
                     SessionVerifyOutcome(info, effectiveFreeState, true, connectedStatus, null, false)
@@ -631,44 +537,22 @@ class SubscriptionRepository(
                     upsertUserProfile(snapshot, activeCode = null)
                     SessionVerifyOutcome(null, effectiveFreeState, false, connectedStatus, err, false)
                 }
-                ServerVerifyInternalResult(
-                    outcome = outcome,
-                    apiResponse = body ?: connectBody,
-                    httpCode = response.code(),
-                    errorDetail = failureReason
-                )
             } else {
-                val errBodyRaw = response.errorBody()?.string()
-                val serverErr = extractErrorMessage(errBodyRaw)
+                val serverErr = extractErrorMessage(response.errorBody()?.string())
                 if (response.code() in setOf(400, 403, 409, 422) && serverErr != null) {
                     settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
                     settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
                     settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, serverErr))
-                    ServerVerifyInternalResult(
-                        outcome = SessionVerifyOutcome(null, effectiveFreeState, false, DbConnectionStatus.Connected("متصل"), serverErr, false),
-                        apiResponse = null,
-                        httpCode = response.code(),
-                        errorDetail = serverErr
-                    )
+                    SessionVerifyOutcome(null, effectiveFreeState, false, DbConnectionStatus.Connected("متصل"), serverErr, false)
                 } else {
-                    ServerVerifyInternalResult(
-                        outcome = offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked),
-                        apiResponse = null,
-                        httpCode = response.code(),
-                        errorDetail = serverErr ?: "HTTP ${response.code()}"
-                    )
+                    offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked)
                 }
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
-            ServerVerifyInternalResult(
-                outcome = offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked),
-                apiResponse = null,
-                httpCode = null,
-                errorDetail = "${t.javaClass.simpleName}: ${t.message ?: "تعذر الوصول إلى الخادم"}"
-            )
+            offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked)
         }
     }
 
@@ -1363,171 +1247,4 @@ class SubscriptionRepository(
         }
     }
 
-    private fun formatJsonOrRaw(raw: String?): String {
-        val text = raw?.trim().orEmpty()
-        if (text.isBlank()) return ""
-        return try {
-            when {
-                text.startsWith("{") -> JSONObject(text).toString(2)
-                text.startsWith("[") -> JSONArray(text).toString(2)
-                else -> text
-            }
-        } catch (_: Exception) {
-            text
-        }
-    }
-
-    private fun synthesizeApiResponseJson(body: SubscriptionApiResponse?): String {
-        if (body == null) return ""
-        return try {
-            JSONObject().apply {
-                put("valid", body.valid)
-                put("is_subscribed", body.isSubscribed)
-                put("is_active", body.isActive)
-                put("status", body.status)
-                if (body.message.isNotBlank()) put("message", body.message)
-                if (!body.planType.isNullOrBlank()) put("plan_type", body.planType)
-                if (body.code.isNotBlank()) put("code", body.code)
-                if (body.planLabel.isNotBlank()) put("plan_label", body.planLabel)
-                put("free_contacts_used", body.freeContactsUsed)
-                body.freeContactsLimit?.let { put("free_contacts_limit", it) }
-                put("free_tier_exhausted", body.freeTierExhausted)
-                body.maxContacts?.let { put("max_contacts", it) }
-                put("used_contacts", body.usedContacts)
-                body.deviceId?.let { put("device_id", it) }
-            }.toString(2)
-        } catch (_: Exception) {
-            body.toString()
-        }
-    }
-
-    suspend fun buildCurrentLocalReport(context: Context, dbStatus: DbConnectionStatus): ConnectionDetailsReport =
-        withContext(Dispatchers.IO) {
-            val snapshot = UserIdentityManager.getCachedSnapshot(context)
-            val freeState = getFreeAccessStateSync()
-            val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
-            val cached = activeCodeKey?.let { codeDao.getCode(it) }
-            val activeInfo = cached?.takeIf { it.isActive && it.isSubscribed }?.toActiveInfo(snapshot)
-            val outcome = SessionVerifyOutcome(
-                activeInfo = activeInfo,
-                freeAccessState = freeState,
-                isAllowed = activeInfo != null || !freeState.isExhausted,
-                dbStatus = dbStatus,
-                errorMessage = null,
-                isConnectionError = dbStatus !is DbConnectionStatus.Connected
-            )
-            buildConnectionDetailsReport(
-                snapshot = snapshot,
-                outcome = outcome,
-                apiResponse = null,
-                explicitHttpCode = SubscriptionApiService.lastNetworkExchange?.httpCode,
-                explicitError = SubscriptionApiService.lastNetworkExchange?.errorDetail,
-                authExchange = SubscriptionApiService.lastNetworkExchange,
-                clientsSyncSucceeded = null,
-                clientsSyncExchange = null
-            )
-        }
-
-    private suspend fun buildConnectionDetailsReport(
-        snapshot: UserNetworkSnapshot,
-        outcome: SessionVerifyOutcome,
-        apiResponse: SubscriptionApiResponse?,
-        explicitHttpCode: Int?,
-        explicitError: String?,
-        authExchange: NetworkExchangeCapture?,
-        clientsSyncSucceeded: Boolean?,
-        clientsSyncExchange: NetworkExchangeCapture?
-    ): ConnectionDetailsReport {
-        val allContacts = contactDao.getAllContactsSync()
-        val syncedToPhoneCount = allContacts.count { it.isSyncedToPhone }
-        val logsCount = logDao.getLogsCountSync()
-        val pendingDeletesCount = loadPendingDeletedClients().size
-
-        val endpointConfig = ServerEndpointConfig.parse(BuildConfig.DATABASE_URL)
-        val connectedTarget = authExchange?.sanitizedEndpointUrl?.takeIf { it.isNotBlank() }
-            ?: endpointConfig?.baseUrl?.let { "${it}api/subscription/connect" }
-            ?: "غير مهيأ (رابط الخادم غير مضبوط)"
-
-        val authMethodSummary = when {
-            endpointConfig?.authParamName != null && !endpointConfig.authToken.isNullOrBlank() ->
-                "مفعل عبر ${endpointConfig.authParamName} + Authorization Bearer + X-API-Key"
-            apiServiceOverride != null ->
-                "واجهة خادم مباشرة (الاختبار/الحقن)"
-            else ->
-                "غير متوفر"
-        }
-
-        val httpCode = explicitHttpCode ?: authExchange?.httpCode
-        val latency = authExchange?.latencyMs
-        val rawErr = explicitError ?: authExchange?.errorDetail
-
-        val succeeded = outcome.dbStatus is DbConnectionStatus.Connected
-        val (headline, detail) = when (outcome.dbStatus) {
-            is DbConnectionStatus.Connected -> {
-                val codePart = if (httpCode != null) " (HTTP $httpCode)" else ""
-                val timePart = if (latency != null) " خلال ${latency}ms" else ""
-                "نجح الاتصال بالخادم ✅" to "تم التحقق من الجلسة ومزامنة البيانات بنجاح$codePart$timePart."
-            }
-            is DbConnectionStatus.NotConfigured -> {
-                "الخادم غير مهيأ ⚠️" to (rawErr ?: "التطبيق يعمل بالوضع المحلي، يرجى التواصل مع الإدارة على $ADMIN_PHONE_DISPLAY.")
-            }
-            is DbConnectionStatus.Disconnected -> {
-                val errSuffix = rawErr?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
-                "فشل الاتصال بالخادم ❌" to "تعذر إتمام الاتصال بالخادم$errSuffix. التطبيق يواصل العمل محلياً."
-            }
-            is DbConnectionStatus.Checking -> {
-                "جاري التحقق من الاتصال..." to "يتم الآن فحص الاتصال بالخادم..."
-            }
-        }
-
-        val effectivePlan = apiResponse?.planType?.takeIf { it.isNotBlank() }
-            ?: if (outcome.activeInfo != null) "SUBSCRIBED" else if (outcome.freeAccessState.isExhausted) "FREE_EXHAUSTED" else "FREE"
-
-        val formattedServerJson = formatJsonOrRaw(authExchange?.rawResponseBody)
-            .ifBlank { synthesizeApiResponseJson(apiResponse) }
-            .ifBlank {
-                if (succeeded) {
-                    "{\"status\": \"connected\"}"
-                } else {
-                    rawErr ?: "لا توجد استجابة من الخادم"
-                }
-            }
-
-        val formattedSyncJson = formatJsonOrRaw(clientsSyncExchange?.rawResponseBody)
-            .takeIf { it.isNotBlank() }
-
-        return ConnectionDetailsReport(
-            succeeded = succeeded,
-            statusHeadline = headline,
-            statusDetail = detail,
-            connectedWithTarget = connectedTarget,
-            authMethodSummary = authMethodSummary,
-            httpStatusCode = httpCode,
-            latencyMs = latency,
-            errorDetail = rawErr,
-            networkType = snapshot.networkType,
-            deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
-            userId = snapshot.userId,
-            publicIp = snapshot.publicIp,
-            localIp = snapshot.localIp,
-            planType = effectivePlan,
-            freeContactsUsed = outcome.freeAccessState.usedContacts,
-            freeContactsLimit = outcome.freeAccessState.limit,
-            freeTierExhausted = outcome.freeAccessState.isExhausted,
-            isSubscribed = outcome.activeInfo != null,
-            isSubscriptionActive = outcome.activeInfo?.isActive == true,
-            activeCode = outcome.activeInfo?.code,
-            serverStatusText = apiResponse?.status?.ifBlank { if (succeeded) "connected" else "disconnected" }
-                ?: if (succeeded) "connected" else "offline",
-            serverMessageText = apiResponse?.message.orEmpty(),
-            rawServerResponse = formattedServerJson,
-            clientsSyncSucceeded = clientsSyncSucceeded,
-            clientsSyncResponse = formattedSyncJson,
-            localContactsCount = allContacts.size,
-            syncedToPhoneCount = syncedToPhoneCount,
-            localLogsCount = logsCount,
-            pendingDeletesCount = pendingDeletesCount,
-            sampleContacts = allContacts.take(15)
-        )
-    }
 }
