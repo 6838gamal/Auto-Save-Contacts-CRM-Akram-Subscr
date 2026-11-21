@@ -13,6 +13,7 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityMana
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserNetworkSnapshot
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ActivationResult
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ActiveSubscriptionInfo
+import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ConnectionDetailsReport
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.DbConnectionStatus
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.FreeAccessState
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ReviewRequestResult
@@ -61,6 +62,14 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
     private val _dbConnectionStatus = MutableStateFlow<DbConnectionStatus>(DbConnectionStatus.Checking)
     val dbConnectionStatus: StateFlow<DbConnectionStatus> = _dbConnectionStatus.asStateFlow()
 
+    private val _connectionReport = MutableStateFlow<ConnectionDetailsReport?>(null)
+    val connectionReport: StateFlow<ConnectionDetailsReport?> = _connectionReport.asStateFlow()
+
+    private val _showConnectionDialog = MutableStateFlow(false)
+    val showConnectionDialog: StateFlow<Boolean> = _showConnectionDialog.asStateFlow()
+
+    private var hasShownInitialPopup = false
+
     private val _activeSubscription = MutableStateFlow<ActiveSubscriptionInfo?>(null)
     val activeSubscription: StateFlow<ActiveSubscriptionInfo?> = _activeSubscription.asStateFlow()
 
@@ -89,8 +98,8 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
 
     init {
         refreshIdentity()
-        // Immediately verify PostgreSQL connection and send telemetry + client sync on app open
-        syncConnectionAndUserData()
+        // Immediately verify Server API connection, build connection report popup, and send telemetry + client sync on app open
+        syncConnectionAndUserData(showPopup = true)
         registerNetworkReconnectCallback()
 
         // Reactively observe free tier counter (0..100 contacts strictly)
@@ -127,7 +136,7 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
             }
         }
 
-        // Background reconnect loop: keeps retrying until PostgreSQL connection is verified
+        // Background reconnect loop: keeps retrying until Server API connection is verified
         viewModelScope.launch {
             while (isActive) {
                 delay(10_000L)
@@ -206,17 +215,39 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    fun syncConnectionAndUserData(onAutoUnlocked: (() -> Unit)? = null) {
+    fun openConnectionDetailsDialog() {
         viewModelScope.launch {
-            performConnectionAndClientSync(showCheckingState = true, onAutoUnlocked = onAutoUnlocked)
+            if (_connectionReport.value == null) {
+                _connectionReport.value = repo.buildCurrentLocalReport(getApplication(), _dbConnectionStatus.value)
+            }
+            _showConnectionDialog.value = true
+        }
+    }
+
+    fun dismissConnectionDetailsDialog() {
+        _showConnectionDialog.value = false
+    }
+
+    fun syncConnectionAndUserData(
+        showPopup: Boolean = false,
+        onAutoUnlocked: (() -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            performConnectionAndClientSync(
+                showCheckingState = true,
+                triggerPopup = showPopup,
+                onAutoUnlocked = onAutoUnlocked
+            )
         }
     }
 
     private suspend fun performConnectionAndClientSync(
         showCheckingState: Boolean,
+        triggerPopup: Boolean = false,
         onAutoUnlocked: (() -> Unit)? = null
     ) {
         syncMutex.withLock {
+            val previousStatus = _dbConnectionStatus.value
             if (showCheckingState) {
                 _isRefreshingIdentity.value = true
                 _dbConnectionStatus.value = DbConnectionStatus.Checking
@@ -227,6 +258,9 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                 _activeSubscription.value = outcome.activeInfo
                 _freeAccessState.value = outcome.freeAccessState
                 _dbConnectionStatus.value = outcome.dbStatus
+                if (outcome.connectionReport != null) {
+                    _connectionReport.value = outcome.connectionReport
+                }
                 _isExplicitlyLocked.value =
                     !outcome.isAllowed && outcome.activeInfo == null && !outcome.freeAccessState.isExhausted
                 if (outcome.activeInfo != null) {
@@ -234,9 +268,25 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                     _isConnectionError.value = false
                     onAutoUnlocked?.invoke()
                 }
+                val becameConnected =
+                    previousStatus !is DbConnectionStatus.Connected && outcome.dbStatus is DbConnectionStatus.Connected
+                if (triggerPopup || !hasShownInitialPopup || becameConnected) {
+                    hasShownInitialPopup = true
+                    if (_connectionReport.value != null) {
+                        _showConnectionDialog.value = true
+                    }
+                }
             } catch (_: Throwable) {
                 if (repo.isDatabaseConfigured() && _dbConnectionStatus.value !is DbConnectionStatus.Connected) {
-                    _dbConnectionStatus.value = DbConnectionStatus.Disconnected(SubscriptionRepository.MSG_CONTACT_OWNER_OFFLINE)
+                    val disconnected = DbConnectionStatus.Disconnected(SubscriptionRepository.MSG_CONTACT_OWNER_OFFLINE)
+                    _dbConnectionStatus.value = disconnected
+                    _connectionReport.value = repo.buildCurrentLocalReport(getApplication(), disconnected)
+                }
+                if (triggerPopup || !hasShownInitialPopup) {
+                    hasShownInitialPopup = true
+                    if (_connectionReport.value != null) {
+                        _showConnectionDialog.value = true
+                    }
                 }
             } finally {
                 _initialSyncCompleted.value = true

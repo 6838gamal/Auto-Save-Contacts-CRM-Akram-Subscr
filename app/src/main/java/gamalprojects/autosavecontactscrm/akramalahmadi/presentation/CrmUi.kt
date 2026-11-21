@@ -138,6 +138,24 @@ fun AutoSaveCrmApp(
                         )
                     }
                 }
+
+                val showConnectionDialog by subscriptionViewModel.showConnectionDialog.collectAsStateWithLifecycle()
+                val connectionReport by subscriptionViewModel.connectionReport.collectAsStateWithLifecycle()
+                val isRefreshingConnection by subscriptionViewModel.isRefreshingIdentity.collectAsStateWithLifecycle()
+                val activeReport = connectionReport
+                if (showConnectionDialog && activeReport != null && currentScreen != Screen.SPLASH) {
+                    ConnectionDetailsPopupDialog(
+                        report = activeReport,
+                        isRefreshing = isRefreshingConnection,
+                        onRetrySync = {
+                            subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
+                                viewModel.navigateTo(Screen.DASHBOARD)
+                                viewModel.tryStartMonitoringAutomatically()
+                            })
+                        },
+                        onDismiss = { subscriptionViewModel.dismissConnectionDetailsDialog() }
+                    )
+                }
             }
         )
     }
@@ -528,13 +546,16 @@ fun DashboardScreen(
         }
         if (dbStatus !is gamalprojects.autosavecontactscrm.akramalahmadi.repositories.DbConnectionStatus.Checking) {
             item {
-                PostgresConnectionBadgeCard(
+                ServerConnectionBadgeCard(
                     dbStatus = dbStatus,
                     isBusy = isRefreshingDb,
                     onRetrySync = {
-                        subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
+                        subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
                             Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         })
+                    },
+                    onShowDetails = {
+                        subscriptionViewModel.openConnectionDetailsDialog()
                     }
                 )
             }
@@ -1411,13 +1432,16 @@ fun SettingsScreen(
         }
         if (dbStatus !is gamalprojects.autosavecontactscrm.akramalahmadi.repositories.DbConnectionStatus.Checking) {
             item {
-                PostgresConnectionBadgeCard(
+                ServerConnectionBadgeCard(
                     dbStatus = dbStatus,
                     isBusy = isRefreshingDb,
                     onRetrySync = {
-                        subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
+                        subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
                             Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         })
+                    },
+                    onShowDetails = {
+                        subscriptionViewModel.openConnectionDetailsDialog()
                     }
                 )
             }

@@ -64,6 +64,7 @@ class DebugConsoleActivity : ComponentActivity() {
                     apiKey = SubscriptionApiService.extractApiKey(databaseUrl),
                     request = SubscriptionConnectRequest(
                         userId = "debug-test",
+                        deviceId = "debug-device",
                         androidId = "debug",
                         installUuid = "debug-uuid",
                         publicIp = "0.0.0.0",
@@ -197,7 +198,7 @@ fun DebugConsoleScreen(
             title = { Text("اختبار الاتصال") },
             text = {
                 Column {
-                    Text("أدخل databaseUrl (مثل https://server.com?api_key=xxx):", fontSize = 12.sp)
+                    Text("أدخل databaseUrl (مثل https://server.onrender.com/mobile_api=xxx):", fontSize = 12.sp)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = url,

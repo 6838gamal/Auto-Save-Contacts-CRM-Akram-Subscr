@@ -16,9 +16,151 @@ import java.net.URI
 import java.net.URLDecoder
 import java.util.concurrent.TimeUnit
 
-// ═══════════════════════════════════════════════════════════
-//  نماذج البيانات (لم أغيّرها)
-// ═══════════════════════════════════════════════════════════
+data class ServerEndpointConfig(
+    val baseUrl: String,
+    val authParamName: String?,
+    val authToken: String?
+) {
+    companion object {
+        private val AUTH_PARAM_KEYS = listOf(
+            "mobile_api",
+            "api_key",
+            "apikey",
+            "token",
+            "secret",
+            "key",
+            "auth"
+        )
+
+        private fun normalizeRaw(rawUrl: String): String {
+            var s = rawUrl.trim()
+            if ((s.startsWith("\"") && s.endsWith("\"") && s.length >= 2) ||
+                (s.startsWith("'") && s.endsWith("'") && s.length >= 2)
+            ) {
+                s = s.substring(1, s.length - 1).trim()
+            }
+            return s
+        }
+
+        fun isPlaceholderOrInvalidScheme(rawUrl: String): String? {
+            val trimmed = normalizeRaw(rawUrl)
+            if (trimmed.isBlank()) return "رابط الخادم فارغ"
+            if (trimmed == "MY_POSTGRES_DATABASE_URL" || trimmed == "MY_SERVER_URL") {
+                return "لا يزال الرابط يحمل القيمة الافتراضية ($trimmed)"
+            }
+            if (trimmed.contains("api.example.com", ignoreCase = true) ||
+                trimmed.contains("YOUR_TOKEN", ignoreCase = true) ||
+                trimmed.contains("YOUR_SECRET", ignoreCase = true)
+            ) {
+                return "الرابط يحتوي على قيمة تجريبية"
+            }
+            if (trimmed.startsWith("postgresql://", ignoreCase = true) ||
+                trimmed.startsWith("postgres://", ignoreCase = true) ||
+                trimmed.startsWith("jdbc:", ignoreCase = true)
+            ) {
+                return "تم إيقاف الاتصال المباشر بـ PostgreSQL؛ يرجى وضع رابط خادم HTTP/HTTPS"
+            }
+            if (!trimmed.startsWith("http://", ignoreCase = true) &&
+                !trimmed.startsWith("https://", ignoreCase = true)
+            ) {
+                return "الرابط يجب أن يبدأ بـ https:// أو http://"
+            }
+            return null
+        }
+
+        fun parse(rawUrl: String): ServerEndpointConfig? {
+            val trimmed = normalizeRaw(rawUrl)
+            if (isPlaceholderOrInvalidScheme(trimmed) != null) return null
+
+            return try {
+                val uri = URI(trimmed)
+                val scheme = uri.scheme?.lowercase() ?: return null
+                val authority = uri.rawAuthority?.takeIf { it.isNotBlank() } ?: return null
+
+                var authParamName: String? = null
+                var authToken: String? = null
+
+                // 1. Check query string first (e.g. ?mobile_api=vale or ?api_key=vale)
+                val rawQuery = uri.rawQuery
+                if (!rawQuery.isNullOrBlank()) {
+                    val pairs = rawQuery.split('&').mapNotNull { pair ->
+                        val idx = pair.indexOf('=')
+                        if (idx > 0) {
+                            val k = URLDecoder.decode(pair.substring(0, idx), "UTF-8").trim()
+                            val v = URLDecoder.decode(pair.substring(idx + 1), "UTF-8").trim()
+                            k to v
+                        } else null
+                    }
+                    for (priorityKey in AUTH_PARAM_KEYS) {
+                        val match = pairs.firstOrNull { (k, v) ->
+                            k.equals(priorityKey, ignoreCase = true) && v.isNotBlank()
+                        }
+                        if (match != null) {
+                            authParamName = match.first
+                            authToken = match.second
+                            break
+                        }
+                    }
+                    if (authToken == null) {
+                        val firstNonBlank = pairs.firstOrNull { (k, v) -> k.isNotBlank() && v.isNotBlank() }
+                        if (firstNonBlank != null) {
+                            authParamName = firstNonBlank.first
+                            authToken = firstNonBlank.second
+                        }
+                    }
+                }
+
+                // 2. Inspect path segments for trailing key=value style (e.g. .../mobile_api=vale)
+                val segments = uri.rawPath.orEmpty()
+                    .split('/')
+                    .filter { it.isNotBlank() }
+                    .toMutableList()
+
+                if (segments.isNotEmpty()) {
+                    val last = segments.last()
+                    val eqIdx = last.indexOf('=')
+                    if (eqIdx > 0) {
+                        val decodedKey = URLDecoder.decode(last.substring(0, eqIdx), "UTF-8").trim()
+                        val decodedVal = URLDecoder.decode(last.substring(eqIdx + 1), "UTF-8").trim()
+                        if (decodedKey.isNotBlank() && decodedVal.isNotBlank()) {
+                            segments.removeAt(segments.lastIndex)
+                            if (authToken == null) {
+                                authParamName = decodedKey
+                                authToken = decodedVal
+                            }
+                        }
+                    }
+                }
+
+                val pathPart = if (segments.isEmpty()) {
+                    "/"
+                } else {
+                    "/" + segments.joinToString("/") + "/"
+                }
+                val cleanBase = "$scheme://$authority$pathPart"
+
+                ServerEndpointConfig(
+                    baseUrl = cleanBase,
+                    authParamName = authParamName,
+                    authToken = authToken
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+}
+
+data class NetworkExchangeCapture(
+    val baseUrl: String,
+    val sanitizedEndpointUrl: String,
+    val authParamName: String?,
+    val httpCode: Int?,
+    val latencyMs: Long?,
+    val rawResponseBody: String?,
+    val errorDetail: String?,
+    val timestamp: Long = System.currentTimeMillis()
+)
 
 @JsonClass(generateAdapter = true)
 data class SubscriptionConnectRequest(
@@ -127,19 +269,20 @@ data class SubscriptionApiResponse(
     @Json(name = "message") val message: String = "",
     @Json(name = "code") val code: String = "",
     @Json(name = "plan_label") val planLabel: String = "",
+    @Json(name = "plan_type") val planType: String? = null,
     @Json(name = "duration_minutes") val durationMinutes: Long = 0L,
     @Json(name = "is_lifetime") val isLifetime: Boolean = false,
     @Json(name = "max_contacts") val maxContacts: Int? = null,
     @Json(name = "used_contacts") val usedContacts: Int = 0,
+    @Json(name = "free_contacts_used") val freeContactsUsed: Int = 0,
+    @Json(name = "free_contacts_limit") val freeContactsLimit: Int? = null,
+    @Json(name = "free_tier_exhausted") val freeTierExhausted: Boolean = false,
     @Json(name = "activated_at") val activatedAt: Long? = null,
     @Json(name = "expires_at") val expiresAt: Long? = null,
     @Json(name = "bound_user_id") val boundUserId: String? = null,
-    @Json(name = "bound_ip") val boundIp: String? = null
+    @Json(name = "bound_ip") val boundIp: String? = null,
+    @Json(name = "device_id") val deviceId: String? = null
 )
-
-// ═══════════════════════════════════════════════════════════
-//  الـ Interface (لم أغيّره)
-// ═══════════════════════════════════════════════════════════
 
 interface SubscriptionApiService {
 
@@ -185,100 +328,100 @@ interface SubscriptionApiService {
         @Body request: ClientSyncBatchRequest
     ): Response<SubscriptionApiResponse>
 
-    // ═══════════════════════════════════════════════════════
-    //  Companion — أضفت logging شامل
-    // ═══════════════════════════════════════════════════════
-
     companion object {
+        @Volatile
+        private var cachedKey: String? = null
 
-        private const val TAG = "API_DEBUG"
+        @Volatile
+        private var cachedService: SubscriptionApiService? = null
+
+        @Volatile
+        var lastNetworkExchange: NetworkExchangeCapture? = null
+            private set
+
+        fun sanitizeUrlToken(raw: String, token: String?): String {
+            if (token.isNullOrBlank()) return raw
+            val masked = if (token.length <= 2) "***" else "${token.take(2)}***"
+            return raw.replace("=$token", "=$masked")
+        }
 
         fun extractApiKey(databaseUrl: String): String? {
-            return try {
-                val uri = URI(databaseUrl.trim())
-                val query = uri.rawQuery ?: return null
-                for (pair in query.split('&')) {
-                    val idx = pair.indexOf('=')
-                    if (idx > 0) {
-                        val k = URLDecoder.decode(pair.substring(0, idx), "UTF-8")
-                        if (k.equals("api_key", ignoreCase = true) ||
-                            k.equals("apikey", ignoreCase = true) ||
-                            k.equals("token", ignoreCase = true)
-                        ) {
-                            return URLDecoder.decode(pair.substring(idx + 1), "UTF-8")
-                                .takeIf { it.isNotBlank() }
-                        }
-                    }
-                }
-                null
-            } catch (e: Exception) {
-                ApiDebugLogger.logError("EXTRACT_KEY", "فشل استخراج API key من الرابط: ${e.message}", e)
-                null
-            }
+            return ServerEndpointConfig.parse(databaseUrl)?.authToken
         }
 
         fun create(databaseUrl: String): SubscriptionApiService? {
-            ApiDebugLogger.log("CREATE", "بدء إنشاء Retrofit من databaseUrl=$databaseUrl")
-
             val trimmed = databaseUrl.trim()
+            synchronized(this) {
+                if (cachedKey == trimmed && cachedService != null) {
+                    return cachedService
+                }
+            }
 
-            // ── فحص 1: الرابط فارغ ──
-            if (trimmed.isBlank()) {
-                ApiDebugLogger.logCreateFailure("databaseUrl فارغ/blank")
+            val invalidReason = ServerEndpointConfig.isPlaceholderOrInvalidScheme(trimmed)
+            if (invalidReason != null) {
+                ApiDebugLogger.logCreateFailure(invalidReason)
                 return null
             }
 
-            // ── فحص 2: القيمة الافتراضية ──
-            if (trimmed == "MY_POSTGRES_DATABASE_URL") {
-                ApiDebugLogger.logCreateFailure("databaseUrl لا يزال القيمة الافتراضية MY_POSTGRES_DATABASE_URL. لم يتم تغييره!")
+            val endpoint = ServerEndpointConfig.parse(trimmed)
+            if (endpoint == null) {
+                ApiDebugLogger.logCreateFailure("تعذر تحليل رابط الخادم: $trimmed")
                 return null
             }
 
-            // ── فحص 3: مثال تجريبي ──
-            if (trimmed.contains("api.example.com", ignoreCase = true)) {
-                ApiDebugLogger.logCreateFailure("databaseUrl يحتوي api.example.com (قيمة تجريبية)")
-                return null
-            }
-
-            // ── فحص 4: يبدأ بـ http/https ──
-            if (!trimmed.startsWith("http://", ignoreCase = true) &&
-                !trimmed.startsWith("https://", ignoreCase = true)
-            ) {
-                ApiDebugLogger.logCreateFailure("databaseUrl لا يبدأ بـ http:// أو https:// — القيمة: $trimmed")
-                return null
-            }
-
-            // ── استخراج baseUrl و apiKey ──
-            val cleanBase = trimmed.substringBefore('?').let {
-                if (it.endsWith("/")) it else "$it/"
-            }
-            val apiKey = extractApiKey(trimmed)
-
-            if (apiKey == null) {
-                ApiDebugLogger.logError("CREATE", "⚠️ لم يُعثر على api_key/apikey/token في الرابط. إن كان السيرفر يتطلبه سيفشل الطلب بـ 401/403.")
-            }
+            ApiDebugLogger.log(
+                "CREATE",
+                "إنشاء عميل الخادم: baseUrl=${endpoint.baseUrl} | authParam=${endpoint.authParamName ?: "none"}"
+            )
 
             return try {
-                // ── Interceptor لتسجيل كل طلب/استجابة ──
+                // Inject extracted server token on every request (headers + original query param if present)
+                val authInterceptor = Interceptor { chain ->
+                    val original = chain.request()
+                    val builder = original.newBuilder()
+
+                    val token = endpoint.authToken
+                    val paramName = endpoint.authParamName
+                    if (!token.isNullOrBlank()) {
+                        if (original.header("Authorization").isNullOrBlank()) {
+                            builder.header("Authorization", "Bearer $token")
+                        }
+                        if (original.header("X-API-Key").isNullOrBlank()) {
+                            builder.header("X-API-Key", token)
+                        }
+                        if (original.header("X-Mobile-API").isNullOrBlank()) {
+                            builder.header("X-Mobile-API", token)
+                        }
+                        if (!paramName.isNullOrBlank() && original.url.queryParameter(paramName) == null) {
+                            val newUrl = original.url.newBuilder()
+                                .addQueryParameter(paramName, token)
+                                .build()
+                            builder.url(newUrl)
+                        }
+                    }
+
+                    chain.proceed(builder.build())
+                }
+
                 val auditInterceptor = Interceptor { chain ->
                     val request = chain.request()
-                    val endpoint = request.url.toString()
+                    val endpointUrl = request.url.toString()
                     val method = request.method
 
-                    // استخراج الهيدرز
                     val headers = mutableMapOf<String, String?>()
                     request.headers.names().forEach { name ->
                         headers[name] = request.header(name)
                     }
 
-                    // استخراج الـ body كنص
                     val bodyText = try {
                         val buffer = Buffer()
                         request.body?.writeTo(buffer)
                         buffer.readUtf8().take(4000)
-                    } catch (_: Exception) { null }
+                    } catch (_: Exception) {
+                        null
+                    }
 
-                    ApiDebugLogger.logRequest(endpoint, method, bodyText, headers)
+                    ApiDebugLogger.logRequest(endpointUrl, method, bodyText, headers)
 
                     val start = System.currentTimeMillis()
                     try {
@@ -287,54 +430,84 @@ interface SubscriptionApiService {
 
                         val responseBody = try {
                             response.peekBody(8000).string()
-                        } catch (_: Exception) { null }
+                        } catch (_: Exception) {
+                            null
+                        }
 
-                        ApiDebugLogger.logResponse(endpoint, response.code, responseBody)
-                        ApiDebugLogger.log("TIMING", "$endpoint استغرق ${elapsed}ms")
+                        ApiDebugLogger.logResponse(endpointUrl, response.code, responseBody)
+                        ApiDebugLogger.log("TIMING", "$endpointUrl استغرق ${elapsed}ms")
 
-                        // تشخيص سريع حسب كود الاستجابة
+                        lastNetworkExchange = NetworkExchangeCapture(
+                            baseUrl = endpoint.baseUrl,
+                            sanitizedEndpointUrl = sanitizeUrlToken(endpointUrl, endpoint.authToken),
+                            authParamName = endpoint.authParamName,
+                            httpCode = response.code,
+                            latencyMs = elapsed,
+                            rawResponseBody = responseBody,
+                            errorDetail = if (response.isSuccessful) null else "HTTP ${response.code}"
+                        )
+
                         when (response.code) {
-                            401, 403 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ ${response.code}: مصادقة فاشلة. تحقق من X-API-Key أو Authorization.")
-                            404 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ 404: المسار غير موجود. تحقق أن baseUrl صحيح (substringBefore '?' قد يقتطع جزءاً مهماً).")
-                            405 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ 405: method غير مسموح. تأكد أن السيرفر يستقبل POST.")
-                            500, 502, 503 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ ${response.code}: خطأ في السيرفر. راجع logs السيرفر.")
+                            401, 403 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ ${response.code}: مصادقة فاشلة. تحقق من مفتاح الخادم.")
+                            404 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ 404: المسار غير موجود ($endpointUrl).")
+                            405 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ 405: الطريقة غير مسموحة (المتوقع POST).")
+                            500, 502, 503, 504 -> ApiDebugLogger.logError("DIAGNOSIS", "❌ ${response.code}: خطأ أو تهيئة في الخادم.")
                             in 200..299 -> ApiDebugLogger.log("DIAGNOSIS", "✅ ${response.code}: نجح الطلب.")
                         }
                         response
                     } catch (e: Exception) {
-                        ApiDebugLogger.logFailure(endpoint, e)
+                        val elapsed = System.currentTimeMillis() - start
+                        lastNetworkExchange = NetworkExchangeCapture(
+                            baseUrl = endpoint.baseUrl,
+                            sanitizedEndpointUrl = sanitizeUrlToken(endpointUrl, endpoint.authToken),
+                            authParamName = endpoint.authParamName,
+                            httpCode = null,
+                            latencyMs = elapsed,
+                            rawResponseBody = null,
+                            errorDetail = "${e.javaClass.simpleName}: ${e.message ?: "تعذر الاتصال"}"
+                        )
+                        ApiDebugLogger.logFailure(endpointUrl, e)
                         throw e
                     }
                 }
 
-                // ── Logging interceptor من OkHttp (يعرض في Logcat أيضاً) ──
                 val logging = HttpLoggingInterceptor { msg ->
-                    // نوجّهه إلى ملفنا بدلاً من Logcat فقط
                     ApiDebugLogger.log("OKHTTP", msg)
                 }.apply {
-                    level = HttpLoggingInterceptor.Level.BODY  // ← BODY مؤقتاً للتشخيص
+                    level = HttpLoggingInterceptor.Level.BASIC
                 }
 
+                // Generous timeouts to support Render cold-start wakeups without blocking UI
                 val client = OkHttpClient.Builder()
-                    .connectTimeout(30, TimeUnit.SECONDS)  // ← رُفعت من 5
-                    .readTimeout(30, TimeUnit.SECONDS)     // ← رُفعت من 5
-                    .writeTimeout(30, TimeUnit.SECONDS)    // ← رُفعت من 5
-                    .callTimeout(60, TimeUnit.SECONDS)     // ← رُفعت من 6
+                    .connectTimeout(20, TimeUnit.SECONDS)
+                    .readTimeout(30, TimeUnit.SECONDS)
+                    .writeTimeout(30, TimeUnit.SECONDS)
+                    .callTimeout(45, TimeUnit.SECONDS)
+                    .addInterceptor(authInterceptor)
                     .addInterceptor(auditInterceptor)
                     .addInterceptor(logging)
                     .build()
 
                 val service = Retrofit.Builder()
-                    .baseUrl(cleanBase)
+                    .baseUrl(endpoint.baseUrl)
                     .client(client)
                     .addConverterFactory(MoshiConverterFactory.create())
                     .build()
                     .create(SubscriptionApiService::class.java)
 
-                ApiDebugLogger.logCreateSuccess(cleanBase, apiKey != null)
+                synchronized(this) {
+                    cachedKey = trimmed
+                    cachedService = service
+                }
+
+                ApiDebugLogger.logCreateSuccess(endpoint.baseUrl, endpoint.authToken != null)
                 service
             } catch (e: Exception) {
-                ApiDebugLogger.logError("CREATE_FAIL", "استثناء أثناء إنشاء Retrofit: ${e.javaClass.simpleName}: ${e.message}", e)
+                ApiDebugLogger.logError(
+                    "CREATE_FAIL",
+                    "استثناء أثناء إنشاء عميل الخادم: ${e.javaClass.simpleName}: ${e.message}",
+                    e
+                )
                 null
             }
         }

@@ -9,10 +9,11 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.database.SubscriptionCode
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.UserDeviceProfileEntity
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityManager
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserNetworkSnapshot
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.ApiDebugLogger
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncBatchRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncItem
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresConnectionConfig
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSubscriptionGateway
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.NetworkExchangeCapture
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.ServerEndpointConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionActivateRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiResponse
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiService
@@ -99,13 +100,48 @@ data class FreeAccessState(
     val remainingContacts: Int get() = (limit - usedContacts).coerceAtLeast(0)
 }
 
+data class ConnectionDetailsReport(
+    val succeeded: Boolean,
+    val statusHeadline: String,
+    val statusDetail: String,
+    val connectedWithTarget: String,
+    val authMethodSummary: String,
+    val httpStatusCode: Int?,
+    val latencyMs: Long?,
+    val errorDetail: String?,
+    val networkType: String,
+    val deviceId: String,
+    val userId: String,
+    val publicIp: String,
+    val localIp: String,
+    val planType: String,
+    val freeContactsUsed: Int,
+    val freeContactsLimit: Int,
+    val freeTierExhausted: Boolean,
+    val isSubscribed: Boolean,
+    val isSubscriptionActive: Boolean,
+    val activeCode: String?,
+    val serverStatusText: String,
+    val serverMessageText: String,
+    val rawServerResponse: String,
+    val clientsSyncSucceeded: Boolean?,
+    val clientsSyncResponse: String?,
+    val localContactsCount: Int,
+    val syncedToPhoneCount: Int,
+    val localLogsCount: Int,
+    val pendingDeletesCount: Int,
+    val sampleContacts: List<Contact>,
+    val capturedAt: Long = System.currentTimeMillis()
+)
+
 data class SessionVerifyOutcome(
     val activeInfo: ActiveSubscriptionInfo?,
     val freeAccessState: FreeAccessState,
     val isAllowed: Boolean,
     val dbStatus: DbConnectionStatus,
     val errorMessage: String?,
-    val isConnectionError: Boolean
+    val isConnectionError: Boolean,
+    val connectionReport: ConnectionDetailsReport? = null
 )
 
 data class LocalAccessDecision(
@@ -117,8 +153,7 @@ data class LocalAccessDecision(
 
 class SubscriptionRepository(
     private val db: AppDatabase,
-    private val apiServiceOverride: SubscriptionApiService? = null,
-    private val postgresGatewayOverride: PostgresSubscriptionGateway? = null
+    private val apiServiceOverride: SubscriptionApiService? = null
 ) {
 
     companion object {
@@ -128,6 +163,7 @@ class SubscriptionRepository(
         private const val KEY_FREE_USED = "free_contacts_used"
         private const val KEY_FREE_EXHAUSTED = "free_tier_exhausted"
         private const val KEY_PENDING_DELETED_CLIENTS = "pending_deleted_clients_json"
+        private const val KEY_PENDING_TELEMETRY_SYNC = "pending_telemetry_sync"
 
         const val FREE_CONTACTS_LIMIT = 100
         const val ADMIN_PHONE_DISPLAY = "+967 772 920 748"
@@ -145,16 +181,9 @@ class SubscriptionRepository(
     private val profileDao = db.userDeviceProfileDao()
     private val settingDao = db.settingDao()
     private val contactDao = db.contactDao()
+    private val logDao = db.logEntryDao()
 
-    fun isDatabaseConfigured(): Boolean =
-        resolvePostgresGateway() != null || resolveApiService() != null
-
-    private fun resolvePostgresGateway(): PostgresSubscriptionGateway? {
-        if (postgresGatewayOverride != null) return postgresGatewayOverride
-        if (apiServiceOverride != null) return null
-        val cfg = PostgresConnectionConfig.parse(BuildConfig.DATABASE_URL) ?: return null
-        return PostgresSubscriptionGateway(cfg)
-    }
+    fun isDatabaseConfigured(): Boolean = resolveApiService() != null
 
     private fun resolveApiService(): SubscriptionApiService? {
         return apiServiceOverride ?: SubscriptionApiService.create(BuildConfig.DATABASE_URL)
@@ -241,7 +270,7 @@ class SubscriptionRepository(
 
     /**
      * Instant local Room check (< 10ms, zero network) used so the splash screen
-     * never hangs when the internet or database is unreachable.
+     * never hangs when offline or when the remote server is waking up from cold start.
      */
     suspend fun checkLocalAccessQuick(context: Context): LocalAccessDecision = withContext(Dispatchers.IO) {
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
@@ -294,11 +323,11 @@ class SubscriptionRepository(
     }
 
     /**
-     * Runs on app launch (and on manual connection refresh):
-     * 1. Captures user identity & public IP.
-     * 2. Connects to PostgreSQL (via DATABASE_URL) and sends/syncs user telemetry immediately.
-     * 3. Validates any active subscription or checks if the admin approved/bound a subscription in PostgreSQL.
-     * 4. Never crashes if PostgreSQL is unreachable; alerts user to contact owner (+967 772 920 748).
+     * Connects to the remote Server API (via DATABASE_URL) using the immutable device ID:
+     * 1. Captures stable device identity & public IP.
+     * 2. Sends device check/registration + free-plan or subscription telemetry immediately.
+     * 3. Validates active subscription or checks if the admin approved a subscription on the server.
+     * 4. Replays pending client updates/deletions whenever the server responds 2xx.
      */
     suspend fun verifyCurrentSession(context: Context): SessionVerifyOutcome = withContext(Dispatchers.IO) {
         val snapshot = UserIdentityManager.fetchPublicNetworkInfo(context)
@@ -354,26 +383,9 @@ class SubscriptionRepository(
             )
         }
 
-        val pgGateway = resolvePostgresGateway()
-        if (pgGateway != null) {
-            val outcome = verifyViaDirectPostgres(
-                gateway = pgGateway,
-                snapshot = snapshot,
-                freeState = freeState,
-                totalContacts = totalContacts,
-                activeCodeKey = activeCodeKey,
-                cachedCode = cached,
-                explicitlyLocked = explicitlyLocked
-            )
-            if (outcome.dbStatus is DbConnectionStatus.Connected) {
-                syncAllClientsToDatabase(context)
-            }
-            return@withContext outcome
-        }
-
         val api = resolveApiService()
         if (api != null) {
-            val outcome = verifyViaHttpApi(
+            val serverCapture = verifyViaServerApi(
                 api = api,
                 snapshot = snapshot,
                 freeState = freeState,
@@ -382,19 +394,35 @@ class SubscriptionRepository(
                 cachedCode = cached,
                 explicitlyLocked = explicitlyLocked
             )
-            if (outcome.dbStatus is DbConnectionStatus.Connected) {
-                syncAllClientsToDatabase(context)
+            val authExchange = SubscriptionApiService.lastNetworkExchange
+            var clientsSyncOk: Boolean? = null
+            var clientsSyncExchange: NetworkExchangeCapture? = null
+            if (serverCapture.outcome.dbStatus is DbConnectionStatus.Connected) {
+                clientsSyncOk = syncAllClientsToDatabase(context)
+                clientsSyncExchange = SubscriptionApiService.lastNetworkExchange
             }
-            return@withContext outcome
+            val report = buildConnectionDetailsReport(
+                snapshot = snapshot,
+                outcome = serverCapture.outcome,
+                apiResponse = serverCapture.apiResponse,
+                explicitHttpCode = serverCapture.httpCode,
+                explicitError = serverCapture.errorDetail,
+                authExchange = authExchange,
+                clientsSyncSucceeded = clientsSyncOk,
+                clientsSyncExchange = clientsSyncExchange
+            )
+            return@withContext serverCapture.outcome.copy(connectionReport = report)
         }
 
-        // Database not configured: app still works normally and prompts to contact administration for review
+        // Server not configured yet: allow free usage up to 100 or valid cached code, prompt to contact owner
+        ApiDebugLogger.logWarn("REPO", "الخادم غير مربوط أو الرابط غير صالح — التشغيل في الوضع المحلي.")
+        val configInvalidReason = ServerEndpointConfig.isPlaceholderOrInvalidScheme(BuildConfig.DATABASE_URL)
         val notConfiguredStatus = DbConnectionStatus.NotConfigured(MSG_DB_NOT_CONFIGURED)
-        if (!activeCodeKey.isNullOrBlank()) {
+        val rawOutcome = if (!activeCodeKey.isNullOrBlank()) {
             if (cached != null && cached.isActive && cached.isSubscribed &&
                 (cached.boundUserId.isNullOrBlank() || cached.boundUserId == snapshot.userId)
             ) {
-                return@withContext SessionVerifyOutcome(
+                SessionVerifyOutcome(
                     activeInfo = cached.toActiveInfo(snapshot),
                     freeAccessState = freeState,
                     isAllowed = true,
@@ -402,19 +430,18 @@ class SubscriptionRepository(
                     errorMessage = null,
                     isConnectionError = false
                 )
+            } else {
+                SessionVerifyOutcome(
+                    activeInfo = null,
+                    freeAccessState = freeState,
+                    isAllowed = !freeState.isExhausted && !explicitlyLocked,
+                    dbStatus = notConfiguredStatus,
+                    errorMessage = if (!freeState.isExhausted && !explicitlyLocked) null else MSG_DB_NOT_CONFIGURED,
+                    isConnectionError = true
+                )
             }
-            return@withContext SessionVerifyOutcome(
-                activeInfo = null,
-                freeAccessState = freeState,
-                isAllowed = !freeState.isExhausted && !explicitlyLocked,
-                dbStatus = notConfiguredStatus,
-                errorMessage = if (!freeState.isExhausted && !explicitlyLocked) null else MSG_DB_NOT_CONFIGURED,
-                isConnectionError = true
-            )
-        }
-
-        if (!freeState.isExhausted && !explicitlyLocked) {
-            return@withContext SessionVerifyOutcome(
+        } else if (!freeState.isExhausted && !explicitlyLocked) {
+            SessionVerifyOutcome(
                 activeInfo = null,
                 freeAccessState = freeState,
                 isAllowed = true,
@@ -422,101 +449,39 @@ class SubscriptionRepository(
                 errorMessage = null,
                 isConnectionError = false
             )
+        } else {
+            val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
+                ?: if (freeState.isExhausted) MSG_FREE_LIMIT_REACHED else null
+            SessionVerifyOutcome(
+                activeInfo = null,
+                freeAccessState = freeState,
+                isAllowed = false,
+                dbStatus = notConfiguredStatus,
+                errorMessage = reason,
+                isConnectionError = false
+            )
         }
-
-        val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
-            ?: if (freeState.isExhausted) MSG_FREE_LIMIT_REACHED else null
-        return@withContext SessionVerifyOutcome(
-            activeInfo = null,
-            freeAccessState = freeState,
-            isAllowed = false,
-            dbStatus = notConfiguredStatus,
-            errorMessage = reason,
-            isConnectionError = false
+        val report = buildConnectionDetailsReport(
+            snapshot = snapshot,
+            outcome = rawOutcome,
+            apiResponse = null,
+            explicitHttpCode = null,
+            explicitError = configInvalidReason ?: "رابط الخادم غير مضبوط في متغيرات البيئة",
+            authExchange = null,
+            clientsSyncSucceeded = null,
+            clientsSyncExchange = null
         )
+        return@withContext rawOutcome.copy(connectionReport = report)
     }
 
-    private suspend fun verifyViaDirectPostgres(
-        gateway: PostgresSubscriptionGateway,
-        snapshot: UserNetworkSnapshot,
-        freeState: FreeAccessState,
-        totalContacts: Int,
-        activeCodeKey: String?,
-        cachedCode: SubscriptionCodeEntity?,
-        explicitlyLocked: Boolean
-    ): SessionVerifyOutcome {
-        val cachedUsedQuota = cachedCode?.usedContacts ?: 0
-        return try {
-            val connectOutcome = gateway.connectAndSyncUser(
-                snapshot = snapshot,
-                totalContacts = totalContacts,
-                freeState = freeState,
-                activeCode = activeCodeKey
-            )
-            val dbStatus = DbConnectionStatus.Connected(connectOutcome.message)
+    private data class ServerVerifyInternalResult(
+        val outcome: SessionVerifyOutcome,
+        val apiResponse: SubscriptionApiResponse? = null,
+        val httpCode: Int? = null,
+        val errorDetail: String? = null
+    )
 
-            // Reconcile free-tier state from database if the device already had usage recorded (e.g. after reinstall)
-            val reconciledUsed = maxOf(freeState.usedContacts, connectOutcome.serverFreeUsed)
-            val reconciledExhausted = freeState.isExhausted ||
-                connectOutcome.serverFreeExhausted ||
-                reconciledUsed >= FREE_CONTACTS_LIMIT
-            if (reconciledUsed > freeState.usedContacts) {
-                settingDao.insertSetting(SettingEntity(KEY_FREE_USED, reconciledUsed.toString()))
-            }
-            if (reconciledExhausted && !freeState.isExhausted) {
-                settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
-                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, MSG_FREE_LIMIT_REACHED))
-            }
-            val effectiveFreeState = FreeAccessState(
-                usedContacts = reconciledUsed,
-                limit = FREE_CONTACTS_LIMIT,
-                isExhausted = reconciledExhausted
-            )
-
-            if (!activeCodeKey.isNullOrBlank()) {
-                val verifiedBody = gateway.verifySession(
-                    code = activeCodeKey,
-                    snapshot = snapshot,
-                    totalContacts = totalContacts,
-                    usedQuota = cachedUsedQuota
-                )
-                val failureReason = validateApiStatusFlags(verifiedBody, cachedUsedQuota)
-                if (failureReason == null) {
-                    val info = persistActiveSubscription(activeCodeKey, verifiedBody, snapshot, existingUsed = cachedUsedQuota)
-                    SessionVerifyOutcome(info, effectiveFreeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
-                } else {
-                    settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
-                    settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
-                    settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, failureReason))
-                    upsertUserProfile(snapshot, activeCode = null)
-                    SessionVerifyOutcome(null, effectiveFreeState, isAllowed = false, dbStatus = dbStatus, errorMessage = failureReason, isConnectionError = false)
-                }
-            } else {
-                // Check if admin approved a subscription for this device directly in PostgreSQL
-                val approved = connectOutcome.activeSubscription
-                val failure = if (approved != null) validateApiStatusFlags(approved, 0) else null
-                if (approved != null && failure == null) {
-                    settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
-                    val info = persistActiveSubscription(approved.code, approved, snapshot, existingUsed = approved.usedContacts)
-                    return SessionVerifyOutcome(info, effectiveFreeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
-                }
-
-                if (!effectiveFreeState.isExhausted && !explicitlyLocked) {
-                    SessionVerifyOutcome(null, effectiveFreeState, isAllowed = true, dbStatus = dbStatus, errorMessage = null, isConnectionError = false)
-                } else {
-                    val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
-                        ?: MSG_FREE_LIMIT_REACHED
-                    SessionVerifyOutcome(null, effectiveFreeState, isAllowed = false, dbStatus = dbStatus, errorMessage = reason, isConnectionError = false)
-                }
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Throwable) {
-            offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked)
-        }
-    }
-
-    private suspend fun verifyViaHttpApi(
+    private suspend fun verifyViaServerApi(
         api: SubscriptionApiService,
         snapshot: UserNetworkSnapshot,
         freeState: FreeAccessState,
@@ -524,18 +489,19 @@ class SubscriptionRepository(
         activeCodeKey: String?,
         cachedCode: SubscriptionCodeEntity?,
         explicitlyLocked: Boolean
-    ): SessionVerifyOutcome {
+    ): ServerVerifyInternalResult {
         val cachedUsedQuota = cachedCode?.usedContacts ?: 0
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
+        val deviceId = UserIdentityManager.getImmutableDeviceId(snapshot)
+
         return try {
-            // Send user telemetry on launch even before subscribing
             val connectResp = try {
                 api.connectAndSyncUser(
                     authorization = authHeader,
                     apiKey = apiKeyHeader,
                     request = SubscriptionConnectRequest(
                         userId = snapshot.userId,
-                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
+                        deviceId = deviceId,
                         androidId = snapshot.androidId,
                         installUuid = snapshot.installUuid,
                         publicIp = snapshot.publicIp,
@@ -559,31 +525,78 @@ class SubscriptionRepository(
                 null
             }
 
-            val connectedOk = connectResp?.isSuccessful == true
-            val dbStatus = if (connectedOk) {
-                DbConnectionStatus.Connected("متصل")
-            } else if (connectResp != null && connectResp.code() >= 500) {
-                throw IllegalStateException("Server 5xx")
+            val connectSucceeded = connectResp?.isSuccessful == true
+            val connectBody = if (connectSucceeded) connectResp?.body() else null
+            val connectErrText = if (!connectSucceeded && connectResp != null) {
+                "HTTP ${connectResp.code()}: ${extractErrorMessage(connectResp.errorBody()?.string()) ?: connectResp.message()}"
             } else {
-                DbConnectionStatus.Connected("متصل")
+                null
+            }
+
+            // Reconcile server-stored free usage if the server recognizes this immutable device after reinstall
+            val serverFreeUsed = connectBody?.freeContactsUsed ?: 0
+            val reconciledUsed = maxOf(freeState.usedContacts, serverFreeUsed)
+            val reconciledExhausted = freeState.isExhausted ||
+                (connectBody?.freeTierExhausted == true) ||
+                reconciledUsed >= FREE_CONTACTS_LIMIT
+
+            if (reconciledUsed > freeState.usedContacts) {
+                settingDao.insertSetting(SettingEntity(KEY_FREE_USED, reconciledUsed.toString()))
+            }
+            if (reconciledExhausted && !freeState.isExhausted) {
+                settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, MSG_FREE_LIMIT_REACHED))
+            }
+
+            val effectiveFreeState = FreeAccessState(
+                usedContacts = reconciledUsed,
+                limit = FREE_CONTACTS_LIMIT,
+                isExhausted = reconciledExhausted
+            )
+
+            if (connectSucceeded) {
+                settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "0"))
+            } else {
+                settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
             }
 
             if (activeCodeKey.isNullOrBlank()) {
-                val body = connectResp?.body()
-                if (body != null && body.valid && body.isSubscribed && body.isActive && body.code.isNotBlank()) {
-                    val failure = validateApiStatusFlags(body, 0)
+                if (!connectSucceeded) {
+                    return ServerVerifyInternalResult(
+                        outcome = offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked),
+                        apiResponse = null,
+                        httpCode = connectResp?.code(),
+                        errorDetail = connectErrText
+                    )
+                }
+
+                val dbStatus = DbConnectionStatus.Connected("متصل")
+                if (connectBody != null && connectBody.valid && connectBody.isSubscribed && connectBody.isActive && connectBody.code.isNotBlank()) {
+                    val failure = validateApiStatusFlags(connectBody, 0)
                     if (failure == null) {
                         settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
-                        val info = persistActiveSubscription(body.code, body, snapshot, existingUsed = body.usedContacts)
-                        return SessionVerifyOutcome(info, freeState, true, dbStatus, null, false)
+                        val info = persistActiveSubscription(connectBody.code, connectBody, snapshot, existingUsed = connectBody.usedContacts)
+                        return ServerVerifyInternalResult(
+                            outcome = SessionVerifyOutcome(info, effectiveFreeState, true, dbStatus, null, false),
+                            apiResponse = connectBody,
+                            httpCode = connectResp.code(),
+                            errorDetail = null
+                        )
                     }
                 }
-                if (!freeState.isExhausted && !explicitlyLocked) {
-                    return SessionVerifyOutcome(null, freeState, true, dbStatus, null, false)
+                val outcome = if (!effectiveFreeState.isExhausted && !explicitlyLocked) {
+                    SessionVerifyOutcome(null, effectiveFreeState, true, dbStatus, null, false)
+                } else {
+                    val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
+                        ?: MSG_FREE_LIMIT_REACHED
+                    SessionVerifyOutcome(null, effectiveFreeState, false, dbStatus, reason, false)
                 }
-                val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
-                    ?: MSG_FREE_LIMIT_REACHED
-                return SessionVerifyOutcome(null, freeState, false, dbStatus, reason, false)
+                return ServerVerifyInternalResult(
+                    outcome = outcome,
+                    apiResponse = connectBody,
+                    httpCode = connectResp.code(),
+                    errorDetail = null
+                )
             }
 
             val response = api.verifySession(
@@ -592,7 +605,7 @@ class SubscriptionRepository(
                 request = SubscriptionVerifyRequest(
                     code = activeCodeKey,
                     userId = snapshot.userId,
-                    deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
+                    deviceId = deviceId,
                     androidId = snapshot.androidId,
                     publicIp = snapshot.publicIp,
                     localIp = snapshot.localIp,
@@ -601,35 +614,61 @@ class SubscriptionRepository(
                     usedQuotaCount = cachedUsedQuota
                 )
             )
+
             if (response.isSuccessful) {
                 val body = response.body()
                 val failureReason = validateApiStatusFlags(body, cachedUsedQuota)
-                if (body != null && failureReason == null) {
+                val connectedStatus = DbConnectionStatus.Connected("متصل")
+                val outcome = if (body != null && failureReason == null) {
+                    settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "0"))
                     val info = persistActiveSubscription(activeCodeKey, body, snapshot, existingUsed = cachedUsedQuota)
-                    SessionVerifyOutcome(info, freeState, true, DbConnectionStatus.Connected("متصل"), null, false)
+                    SessionVerifyOutcome(info, effectiveFreeState, true, connectedStatus, null, false)
                 } else {
                     val err = failureReason ?: MSG_CONTACT_OWNER_OFFLINE
                     settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
                     settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
                     settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, err))
                     upsertUserProfile(snapshot, activeCode = null)
-                    SessionVerifyOutcome(null, freeState, false, dbStatus, err, false)
+                    SessionVerifyOutcome(null, effectiveFreeState, false, connectedStatus, err, false)
                 }
+                ServerVerifyInternalResult(
+                    outcome = outcome,
+                    apiResponse = body ?: connectBody,
+                    httpCode = response.code(),
+                    errorDetail = failureReason
+                )
             } else {
-                val serverErr = extractErrorMessage(response.errorBody()?.string())
-                if (response.code() in 400..499 && serverErr != null) {
+                val errBodyRaw = response.errorBody()?.string()
+                val serverErr = extractErrorMessage(errBodyRaw)
+                if (response.code() in setOf(400, 403, 409, 422) && serverErr != null) {
                     settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
                     settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
                     settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, serverErr))
-                    SessionVerifyOutcome(null, freeState, false, dbStatus, serverErr, false)
+                    ServerVerifyInternalResult(
+                        outcome = SessionVerifyOutcome(null, effectiveFreeState, false, DbConnectionStatus.Connected("متصل"), serverErr, false),
+                        apiResponse = null,
+                        httpCode = response.code(),
+                        errorDetail = serverErr
+                    )
                 } else {
-                    SessionVerifyOutcome(null, freeState, false, DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE), MSG_CONTACT_OWNER_OFFLINE, true)
+                    ServerVerifyInternalResult(
+                        outcome = offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked),
+                        apiResponse = null,
+                        httpCode = response.code(),
+                        errorDetail = serverErr ?: "HTTP ${response.code()}"
+                    )
                 }
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
-            offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked)
+        } catch (t: Throwable) {
+            settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
+            ServerVerifyInternalResult(
+                outcome = offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked),
+                apiResponse = null,
+                httpCode = null,
+                errorDetail = "${t.javaClass.simpleName}: ${t.message ?: "تعذر الوصول إلى الخادم"}"
+            )
         }
     }
 
@@ -680,55 +719,44 @@ class SubscriptionRepository(
         freeState: FreeAccessState,
         activeCode: String?
     ): DbConnectionStatus {
-        val pgGateway = resolvePostgresGateway()
-        if (pgGateway != null) {
-            return try {
-                val outcome = pgGateway.connectAndSyncUser(snapshot, totalContacts, freeState, activeCode)
-                DbConnectionStatus.Connected(outcome.message)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
-            }
-        }
-        val api = resolveApiService()
-        if (api != null) {
-            val (authHeader, apiKeyHeader) = resolveAuthHeaders()
-            return try {
-                val resp = api.connectAndSyncUser(
-                    authorization = authHeader,
-                    apiKey = apiKeyHeader,
-                    request = SubscriptionConnectRequest(
-                        userId = snapshot.userId,
-                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
-                        androidId = snapshot.androidId,
-                        installUuid = snapshot.installUuid,
-                        publicIp = snapshot.publicIp,
-                        localIp = snapshot.localIp,
-                        locationInfo = snapshot.locationInfo,
-                        deviceModel = snapshot.deviceModel,
-                        osVersion = snapshot.osVersion,
-                        networkType = snapshot.networkType,
-                        savedContactsCount = totalContacts,
-                        freeContactsUsed = freeState.usedContacts,
-                        freeContactsLimit = freeState.limit,
-                        freeTierExhausted = freeState.isExhausted,
-                        planType = if (!activeCode.isNullOrBlank()) "SUBSCRIBED" else if (freeState.isExhausted) "FREE_EXHAUSTED" else "FREE",
-                        activeCode = activeCode
-                    )
+        val api = resolveApiService() ?: return DbConnectionStatus.NotConfigured(MSG_DB_NOT_CONFIGURED)
+        val (authHeader, apiKeyHeader) = resolveAuthHeaders()
+        return try {
+            val resp = api.connectAndSyncUser(
+                authorization = authHeader,
+                apiKey = apiKeyHeader,
+                request = SubscriptionConnectRequest(
+                    userId = snapshot.userId,
+                    deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
+                    androidId = snapshot.androidId,
+                    installUuid = snapshot.installUuid,
+                    publicIp = snapshot.publicIp,
+                    localIp = snapshot.localIp,
+                    locationInfo = snapshot.locationInfo,
+                    deviceModel = snapshot.deviceModel,
+                    osVersion = snapshot.osVersion,
+                    networkType = snapshot.networkType,
+                    savedContactsCount = totalContacts,
+                    freeContactsUsed = freeState.usedContacts,
+                    freeContactsLimit = freeState.limit,
+                    freeTierExhausted = freeState.isExhausted,
+                    planType = if (!activeCode.isNullOrBlank()) "SUBSCRIBED" else if (freeState.isExhausted) "FREE_EXHAUSTED" else "FREE",
+                    activeCode = activeCode
                 )
-                if (resp.isSuccessful) {
-                    DbConnectionStatus.Connected("متصل")
-                } else {
-                    DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
+            )
+            if (resp.isSuccessful) {
+                settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "0"))
+                DbConnectionStatus.Connected("متصل")
+            } else {
+                settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
                 DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
+            DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
         }
-        return DbConnectionStatus.NotConfigured(MSG_DB_NOT_CONFIGURED)
     }
 
     suspend fun activateSubscriptionCode(context: Context, rawCode: String): ActivationResult = withContext(Dispatchers.IO) {
@@ -744,100 +772,70 @@ class SubscriptionRepository(
         }
 
         val totalContacts = contactDao.getContactsCountSync()
-        val freeState = getFreeAccessStateSync()
         val existingUsed = codeDao.getCode(code)?.usedContacts ?: 0
 
-        // 1. Direct PostgreSQL connection via DATABASE_URL
-        val pgGateway = resolvePostgresGateway()
-        if (pgGateway != null) {
-            return@withContext try {
-                val body = pgGateway.activateCode(
+        val api = resolveApiService()
+            ?: return@withContext ActivationResult.Failure(
+                reason = MSG_DB_NOT_CONFIGURED,
+                isConnectionError = true
+            )
+
+        val (authHeader, apiKeyHeader) = resolveAuthHeaders()
+        return@withContext try {
+            val response = api.activateCode(
+                authorization = authHeader,
+                apiKey = apiKeyHeader,
+                request = SubscriptionActivateRequest(
                     code = code,
-                    snapshot = snapshot,
-                    totalContacts = totalContacts,
-                    freeState = freeState
+                    userId = snapshot.userId,
+                    deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
+                    androidId = snapshot.androidId,
+                    installUuid = snapshot.installUuid,
+                    publicIp = snapshot.publicIp,
+                    localIp = snapshot.localIp,
+                    locationInfo = snapshot.locationInfo,
+                    deviceModel = snapshot.deviceModel,
+                    osVersion = snapshot.osVersion,
+                    networkType = snapshot.networkType,
+                    savedContactsCount = totalContacts
                 )
+            )
+
+            if (response.isSuccessful) {
+                val body = response.body()
                 val failureReason = validateApiStatusFlags(body, existingUsed)
-                if (failureReason == null) {
+                if (body != null && failureReason == null) {
                     settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
                     val info = persistActiveSubscription(code, body, snapshot, existingUsed = existingUsed)
-                    ActivationResult.Success(info, snapshot, body.message.ifBlank { "تم التحقق من قاعدة البيانات وتفعيل الاشتراك بنجاح." })
+                    val msg = body.message.ifBlank { "تم التحقق من الخادم وتفعيل الاشتراك بنجاح." }
+                    ActivationResult.Success(info, snapshot, msg)
                 } else {
-                    ActivationResult.Failure(reason = failureReason, isConnectionError = false)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                ActivationResult.Failure(reason = MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
-            }
-        }
-
-        // 2. HTTP Backend fronting PostgreSQL via DATABASE_URL
-        val api = resolveApiService()
-        if (api != null) {
-            val (authHeader, apiKeyHeader) = resolveAuthHeaders()
-            return@withContext try {
-                val response = api.activateCode(
-                    authorization = authHeader,
-                    apiKey = apiKeyHeader,
-                    request = SubscriptionActivateRequest(
-                        code = code,
-                        userId = snapshot.userId,
-                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
-                        androidId = snapshot.androidId,
-                        installUuid = snapshot.installUuid,
-                        publicIp = snapshot.publicIp,
-                        localIp = snapshot.localIp,
-                        locationInfo = snapshot.locationInfo,
-                        deviceModel = snapshot.deviceModel,
-                        osVersion = snapshot.osVersion,
-                        networkType = snapshot.networkType,
-                        savedContactsCount = totalContacts
+                    ActivationResult.Failure(
+                        reason = failureReason ?: "كود الاشتراك غير صحيح أو بانتظار المراجعة لدى الإدارة.",
+                        isConnectionError = false
                     )
-                )
-
-                if (response.isSuccessful) {
-                    val body = response.body()
-                    val failureReason = validateApiStatusFlags(body, existingUsed)
-                    if (body != null && failureReason == null) {
-                        settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
-                        val info = persistActiveSubscription(code, body, snapshot, existingUsed = existingUsed)
-                        val msg = body.message.ifBlank { "تم التحقق من قاعدة البيانات وتفعيل الاشتراك بنجاح." }
-                        ActivationResult.Success(info, snapshot, msg)
-                    } else {
-                        ActivationResult.Failure(
-                            reason = failureReason ?: "كود الاشتراك غير صحيح أو بانتظار المراجعة في قاعدة البيانات.",
-                            isConnectionError = false
-                        )
-                    }
-                } else {
-                    val parsed = extractErrorMessage(response.errorBody()?.string())
-                    if (response.code() in 400..499) {
-                        ActivationResult.Failure(
-                            reason = parsed ?: "كود الاشتراك غير صالح أو قيد المراجعة.",
-                            isConnectionError = false
-                        )
-                    } else {
-                        ActivationResult.Failure(reason = MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
-                    }
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                ActivationResult.Failure(reason = MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
+            } else {
+                val parsed = extractErrorMessage(response.errorBody()?.string())
+                if (response.code() in 400..499) {
+                    ActivationResult.Failure(
+                        reason = parsed ?: "كود الاشتراك غير صالح أو قيد المراجعة.",
+                        isConnectionError = false
+                    )
+                } else {
+                    ActivationResult.Failure(reason = MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
+                }
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            ActivationResult.Failure(reason = MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
         }
-
-        // 3. No DATABASE_URL configured yet -> prompt to contact administration
-        return@withContext ActivationResult.Failure(
-            reason = MSG_DB_NOT_CONFIGURED,
-            isConnectionError = true
-        )
     }
 
     /**
-     * Submits a formal activation / review request to PostgreSQL so the project owner
-     * can review and approve the user from their external dashboard.
+     * Submits a formal activation / review request to the Server API so the project owner
+     * can review and approve the user from their dashboard.
      */
     suspend fun submitReviewRequest(
         context: Context,
@@ -847,63 +845,45 @@ class SubscriptionRepository(
         val snapshot = UserIdentityManager.fetchPublicNetworkInfo(context)
         upsertUserProfile(snapshot, activeCode = null)
         val totalContacts = contactDao.getContactsCountSync()
-        val freeState = getFreeAccessStateSync()
         val cleanCode = rawCode.trim().uppercase()
 
-        val pgGateway = resolvePostgresGateway()
-        if (pgGateway != null) {
-            return@withContext try {
-                val outcome = pgGateway.submitReviewRequest(
-                    requestedCode = cleanCode,
-                    snapshot = snapshot,
-                    totalContacts = totalContacts,
-                    freeState = freeState,
-                    notes = notes
-                )
-                ReviewRequestResult.Success(outcome.message, outcome.requestId)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                ReviewRequestResult.Failure(MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
-            }
-        }
-
         val api = resolveApiService()
-        if (api != null) {
-            val (authHeader, apiKeyHeader) = resolveAuthHeaders()
-            return@withContext try {
-                val response = api.submitReviewRequest(
-                    authorization = authHeader,
-                    apiKey = apiKeyHeader,
-                    request = SubscriptionReviewRequest(
-                        userId = snapshot.userId,
-                        deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
-                        requestedCode = cleanCode,
-                        publicIp = snapshot.publicIp,
-                        localIp = snapshot.localIp,
-                        deviceModel = snapshot.deviceModel,
-                        locationInfo = snapshot.locationInfo,
-                        savedContactsCount = totalContacts,
-                        notes = notes.ifBlank { "طلب مراجعة وتفعيل اشتراك من التطبيق" }
-                    )
-                )
-                if (response.isSuccessful) {
-                    val body = response.body()
-                    val msg = body?.message?.takeIf { it.isNotBlank() }
-                        ?: "تم إرسال طلب المراجعة إلى قاعدة البيانات بنجاح. تواصل مع الإدارة على $ADMIN_PHONE_DISPLAY"
-                    ReviewRequestResult.Success(msg)
-                } else {
-                    val err = extractErrorMessage(response.errorBody()?.string())
-                    ReviewRequestResult.Failure(err ?: MSG_CONTACT_OWNER_OFFLINE, isConnectionError = response.code() >= 500)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                ReviewRequestResult.Failure(MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
-            }
-        }
+            ?: return@withContext ReviewRequestResult.Failure(MSG_DB_NOT_CONFIGURED, isConnectionError = true)
 
-        ReviewRequestResult.Failure(MSG_DB_NOT_CONFIGURED, isConnectionError = true)
+        val (authHeader, apiKeyHeader) = resolveAuthHeaders()
+        return@withContext try {
+            val response = api.submitReviewRequest(
+                authorization = authHeader,
+                apiKey = apiKeyHeader,
+                request = SubscriptionReviewRequest(
+                    userId = snapshot.userId,
+                    deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
+                    requestedCode = cleanCode,
+                    publicIp = snapshot.publicIp,
+                    localIp = snapshot.localIp,
+                    deviceModel = snapshot.deviceModel,
+                    locationInfo = snapshot.locationInfo,
+                    savedContactsCount = totalContacts,
+                    notes = notes.ifBlank { "طلب مراجعة وتفعيل اشتراك من التطبيق" }
+                )
+            )
+            if (response.isSuccessful) {
+                val body = response.body()
+                val msg = body?.message?.takeIf { it.isNotBlank() }
+                    ?: "تم إرسال طلب المراجعة بنجاح. تواصل مع الإدارة على $ADMIN_PHONE_DISPLAY"
+                ReviewRequestResult.Success(msg)
+            } else {
+                val err = extractErrorMessage(response.errorBody()?.string())
+                ReviewRequestResult.Failure(
+                    err ?: MSG_CONTACT_OWNER_OFFLINE,
+                    isConnectionError = response.code() >= 500 || response.code() == 404
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            ReviewRequestResult.Failure(MSG_CONTACT_OWNER_OFFLINE, isConnectionError = true)
+        }
     }
 
     suspend fun canSaveNewContact(): Boolean = withContext(Dispatchers.IO) {
@@ -996,23 +976,16 @@ class SubscriptionRepository(
     }
 
     private suspend fun syncFreeUsageToBackend(context: Context, freeState: FreeAccessState) {
-        val snapshot = UserIdentityManager.getCachedSnapshot(context)
-        val totalContacts = contactDao.getContactsCountSync()
-        val pgGateway = resolvePostgresGateway()
-        if (pgGateway != null) {
-            try {
-                pgGateway.reportFreeUsage(snapshot, totalContacts, freeState)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-            }
+        val api = resolveApiService()
+        if (api == null) {
+            settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
             return
         }
-
-        val api = resolveApiService() ?: return
+        val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val totalContacts = contactDao.getContactsCountSync()
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
         try {
-            api.connectAndSyncUser(
+            val resp = api.connectAndSyncUser(
                 authorization = authHeader,
                 apiKey = apiKeyHeader,
                 request = SubscriptionConnectRequest(
@@ -1034,30 +1007,27 @@ class SubscriptionRepository(
                     activeCode = null
                 )
             )
+            settingDao.insertSetting(
+                SettingEntity(KEY_PENDING_TELEMETRY_SYNC, if (resp.isSuccessful) "0" else "1")
+            )
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
+            settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
         }
     }
 
     private suspend fun syncUsageToBackend(context: Context, code: String, usedCount: Int) {
-        val snapshot = UserIdentityManager.getCachedSnapshot(context)
-        val totalContacts = contactDao.getContactsCountSync()
-        val pgGateway = resolvePostgresGateway()
-        if (pgGateway != null) {
-            try {
-                pgGateway.reportUsage(code, snapshot, usedCount, totalContacts)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-            }
+        val api = resolveApiService()
+        if (api == null) {
+            settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
             return
         }
-
-        val api = resolveApiService() ?: return
+        val snapshot = UserIdentityManager.getCachedSnapshot(context)
+        val totalContacts = contactDao.getContactsCountSync()
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
         try {
-            api.reportUsage(
+            val resp = api.reportUsage(
                 authorization = authHeader,
                 apiKey = apiKeyHeader,
                 request = SubscriptionUsageRequest(
@@ -1070,9 +1040,13 @@ class SubscriptionRepository(
                     planType = "SUBSCRIBED"
                 )
             )
+            settingDao.insertSetting(
+                SettingEntity(KEY_PENDING_TELEMETRY_SYNC, if (resp.isSuccessful) "0" else "1")
+            )
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
+            settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
         }
     }
 
@@ -1082,7 +1056,7 @@ class SubscriptionRepository(
             return body.message.ifBlank { "لم يتم الاشتراك بعد أو الكود قيد المراجعة. يرجى التواصل مع الإدارة على $ADMIN_PHONE_DISPLAY" }
         }
         if (!body.isActive) {
-            return body.message.ifBlank { "الاشتراك قيد المراجعة أو غير مفعل حالياً في قاعدة البيانات. يرجى التواصل مع $ADMIN_PHONE_DISPLAY" }
+            return body.message.ifBlank { "الاشتراك قيد المراجعة أو غير مفعل حالياً لدى الإدارة. يرجى التواصل مع $ADMIN_PHONE_DISPLAY" }
         }
         if (!body.valid) {
             return body.message.ifBlank { "كود الاشتراك غير صحيح أو منتهي الصلاحية." }
@@ -1110,21 +1084,6 @@ class SubscriptionRepository(
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
         val deviceId = UserIdentityManager.getImmutableDeviceId(snapshot)
         val planType = resolveCurrentPlanType()
-
-        val pgGateway = resolvePostgresGateway()
-        if (pgGateway != null) {
-            return@withContext try {
-                pgGateway.syncClientsBatch(snapshot.userId, listOf(item), planType = planType, deviceId = deviceId)
-                if (isDeleted) {
-                    unmarkPendingClientDeleted(contact.phone)
-                }
-                true
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                false
-            }
-        }
 
         val api = resolveApiService() ?: return@withContext false
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
@@ -1156,9 +1115,7 @@ class SubscriptionRepository(
     }
 
     suspend fun syncAllClientsToDatabase(context: Context): Boolean = withContext(Dispatchers.IO) {
-        val pgGateway = resolvePostgresGateway()
-        val api = if (pgGateway == null) resolveApiService() else null
-        if (pgGateway == null && api == null) return@withContext false
+        val api = resolveApiService() ?: return@withContext false
 
         val contacts = contactDao.getAllContactsSync()
         val activePhones = contacts.mapTo(HashSet()) { it.phone }
@@ -1173,23 +1130,10 @@ class SubscriptionRepository(
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
         val deviceId = UserIdentityManager.getImmutableDeviceId(snapshot)
         val planType = resolveCurrentPlanType()
-        if (pgGateway != null) {
-            return@withContext try {
-                pgGateway.syncClientsBatch(snapshot.userId, items, planType = planType, deviceId = deviceId)
-                if (pendingDeletes.isNotEmpty()) {
-                    savePendingDeletedClients(emptyList())
-                }
-                true
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                false
-            }
-        }
 
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
         return@withContext try {
-            val resp = api!!.syncClients(
+            val resp = api.syncClients(
                 authorization = authHeader,
                 apiKey = apiKeyHeader,
                 request = ClientSyncBatchRequest(
@@ -1346,7 +1290,7 @@ class SubscriptionRepository(
                 boundDeviceModel = snapshot.deviceModel,
                 activatedAt = activatedAt,
                 expiresAt = expiresAt,
-                sourceType = "POSTGRES_DB"
+                sourceType = "SERVER_API"
             )
         )
         settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, resolvedCode))
@@ -1417,5 +1361,173 @@ class SubscriptionRepository(
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun formatJsonOrRaw(raw: String?): String {
+        val text = raw?.trim().orEmpty()
+        if (text.isBlank()) return ""
+        return try {
+            when {
+                text.startsWith("{") -> JSONObject(text).toString(2)
+                text.startsWith("[") -> JSONArray(text).toString(2)
+                else -> text
+            }
+        } catch (_: Exception) {
+            text
+        }
+    }
+
+    private fun synthesizeApiResponseJson(body: SubscriptionApiResponse?): String {
+        if (body == null) return ""
+        return try {
+            JSONObject().apply {
+                put("valid", body.valid)
+                put("is_subscribed", body.isSubscribed)
+                put("is_active", body.isActive)
+                put("status", body.status)
+                if (body.message.isNotBlank()) put("message", body.message)
+                if (!body.planType.isNullOrBlank()) put("plan_type", body.planType)
+                if (body.code.isNotBlank()) put("code", body.code)
+                if (body.planLabel.isNotBlank()) put("plan_label", body.planLabel)
+                put("free_contacts_used", body.freeContactsUsed)
+                body.freeContactsLimit?.let { put("free_contacts_limit", it) }
+                put("free_tier_exhausted", body.freeTierExhausted)
+                body.maxContacts?.let { put("max_contacts", it) }
+                put("used_contacts", body.usedContacts)
+                body.deviceId?.let { put("device_id", it) }
+            }.toString(2)
+        } catch (_: Exception) {
+            body.toString()
+        }
+    }
+
+    suspend fun buildCurrentLocalReport(context: Context, dbStatus: DbConnectionStatus): ConnectionDetailsReport =
+        withContext(Dispatchers.IO) {
+            val snapshot = UserIdentityManager.getCachedSnapshot(context)
+            val freeState = getFreeAccessStateSync()
+            val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            val cached = activeCodeKey?.let { codeDao.getCode(it) }
+            val activeInfo = cached?.takeIf { it.isActive && it.isSubscribed }?.toActiveInfo(snapshot)
+            val outcome = SessionVerifyOutcome(
+                activeInfo = activeInfo,
+                freeAccessState = freeState,
+                isAllowed = activeInfo != null || !freeState.isExhausted,
+                dbStatus = dbStatus,
+                errorMessage = null,
+                isConnectionError = dbStatus !is DbConnectionStatus.Connected
+            )
+            buildConnectionDetailsReport(
+                snapshot = snapshot,
+                outcome = outcome,
+                apiResponse = null,
+                explicitHttpCode = SubscriptionApiService.lastNetworkExchange?.httpCode,
+                explicitError = SubscriptionApiService.lastNetworkExchange?.errorDetail,
+                authExchange = SubscriptionApiService.lastNetworkExchange,
+                clientsSyncSucceeded = null,
+                clientsSyncExchange = null
+            )
+        }
+
+    private suspend fun buildConnectionDetailsReport(
+        snapshot: UserNetworkSnapshot,
+        outcome: SessionVerifyOutcome,
+        apiResponse: SubscriptionApiResponse?,
+        explicitHttpCode: Int?,
+        explicitError: String?,
+        authExchange: NetworkExchangeCapture?,
+        clientsSyncSucceeded: Boolean?,
+        clientsSyncExchange: NetworkExchangeCapture?
+    ): ConnectionDetailsReport {
+        val allContacts = contactDao.getAllContactsSync()
+        val syncedToPhoneCount = allContacts.count { it.isSyncedToPhone }
+        val logsCount = logDao.getLogsCountSync()
+        val pendingDeletesCount = loadPendingDeletedClients().size
+
+        val endpointConfig = ServerEndpointConfig.parse(BuildConfig.DATABASE_URL)
+        val connectedTarget = authExchange?.sanitizedEndpointUrl?.takeIf { it.isNotBlank() }
+            ?: endpointConfig?.baseUrl?.let { "${it}api/subscription/connect" }
+            ?: "غير مهيأ (رابط الخادم غير مضبوط)"
+
+        val authMethodSummary = when {
+            endpointConfig?.authParamName != null && !endpointConfig.authToken.isNullOrBlank() ->
+                "مفعل عبر ${endpointConfig.authParamName} + Authorization Bearer + X-API-Key"
+            apiServiceOverride != null ->
+                "واجهة خادم مباشرة (الاختبار/الحقن)"
+            else ->
+                "غير متوفر"
+        }
+
+        val httpCode = explicitHttpCode ?: authExchange?.httpCode
+        val latency = authExchange?.latencyMs
+        val rawErr = explicitError ?: authExchange?.errorDetail
+
+        val succeeded = outcome.dbStatus is DbConnectionStatus.Connected
+        val (headline, detail) = when (outcome.dbStatus) {
+            is DbConnectionStatus.Connected -> {
+                val codePart = if (httpCode != null) " (HTTP $httpCode)" else ""
+                val timePart = if (latency != null) " خلال ${latency}ms" else ""
+                "نجح الاتصال بالخادم ✅" to "تم التحقق من الجلسة ومزامنة البيانات بنجاح$codePart$timePart."
+            }
+            is DbConnectionStatus.NotConfigured -> {
+                "الخادم غير مهيأ ⚠️" to (rawErr ?: "التطبيق يعمل بالوضع المحلي، يرجى التواصل مع الإدارة على $ADMIN_PHONE_DISPLAY.")
+            }
+            is DbConnectionStatus.Disconnected -> {
+                val errSuffix = rawErr?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
+                "فشل الاتصال بالخادم ❌" to "تعذر إتمام الاتصال بالخادم$errSuffix. التطبيق يواصل العمل محلياً."
+            }
+            is DbConnectionStatus.Checking -> {
+                "جاري التحقق من الاتصال..." to "يتم الآن فحص الاتصال بالخادم..."
+            }
+        }
+
+        val effectivePlan = apiResponse?.planType?.takeIf { it.isNotBlank() }
+            ?: if (outcome.activeInfo != null) "SUBSCRIBED" else if (outcome.freeAccessState.isExhausted) "FREE_EXHAUSTED" else "FREE"
+
+        val formattedServerJson = formatJsonOrRaw(authExchange?.rawResponseBody)
+            .ifBlank { synthesizeApiResponseJson(apiResponse) }
+            .ifBlank {
+                if (succeeded) {
+                    "{\"status\": \"connected\"}"
+                } else {
+                    rawErr ?: "لا توجد استجابة من الخادم"
+                }
+            }
+
+        val formattedSyncJson = formatJsonOrRaw(clientsSyncExchange?.rawResponseBody)
+            .takeIf { it.isNotBlank() }
+
+        return ConnectionDetailsReport(
+            succeeded = succeeded,
+            statusHeadline = headline,
+            statusDetail = detail,
+            connectedWithTarget = connectedTarget,
+            authMethodSummary = authMethodSummary,
+            httpStatusCode = httpCode,
+            latencyMs = latency,
+            errorDetail = rawErr,
+            networkType = snapshot.networkType,
+            deviceId = UserIdentityManager.getImmutableDeviceId(snapshot),
+            userId = snapshot.userId,
+            publicIp = snapshot.publicIp,
+            localIp = snapshot.localIp,
+            planType = effectivePlan,
+            freeContactsUsed = outcome.freeAccessState.usedContacts,
+            freeContactsLimit = outcome.freeAccessState.limit,
+            freeTierExhausted = outcome.freeAccessState.isExhausted,
+            isSubscribed = outcome.activeInfo != null,
+            isSubscriptionActive = outcome.activeInfo?.isActive == true,
+            activeCode = outcome.activeInfo?.code,
+            serverStatusText = apiResponse?.status?.ifBlank { if (succeeded) "connected" else "disconnected" }
+                ?: if (succeeded) "connected" else "offline",
+            serverMessageText = apiResponse?.message.orEmpty(),
+            rawServerResponse = formattedServerJson,
+            clientsSyncSucceeded = clientsSyncSucceeded,
+            clientsSyncResponse = formattedSyncJson,
+            localContactsCount = allContacts.size,
+            syncedToPhoneCount = syncedToPhoneCount,
+            localLogsCount = logsCount,
+            pendingDeletesCount = pendingDeletesCount,
+            sampleContacts = allContacts.take(15)
+        )
     }
 }

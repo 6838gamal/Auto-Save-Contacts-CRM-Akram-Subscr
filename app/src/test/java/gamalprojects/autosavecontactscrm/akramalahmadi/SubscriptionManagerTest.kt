@@ -10,11 +10,7 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityMana
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserNetworkSnapshot
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncBatchRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncItem
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresConnectionConfig
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresQueryResult
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSqlExecutor
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSslMode
-import gamalprojects.autosavecontactscrm.akramalahmadi.network.PostgresSubscriptionGateway
+import gamalprojects.autosavecontactscrm.akramalahmadi.network.ServerEndpointConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionActivateRequest
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiResponse
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.SubscriptionApiService
@@ -66,31 +62,54 @@ class SubscriptionManagerTest {
     }
 
     @Test
-    fun `DATABASE_URL parser handles standard postgresql URI and ignores placeholder`() {
-        assertNull(PostgresConnectionConfig.parse("MY_POSTGRES_DATABASE_URL"))
-        assertNull(PostgresConnectionConfig.parse("https://api.example.com/"))
+    fun `DATABASE_URL parser handles server URL with mobile_api path or query and rejects postgres or placeholder`() {
+        assertNull(ServerEndpointConfig.parse("MY_SERVER_URL"))
+        assertNull(ServerEndpointConfig.parse("MY_POSTGRES_DATABASE_URL"))
+        assertNull(ServerEndpointConfig.parse("https://api.example.com/"))
+        assertNull(ServerEndpointConfig.parse("postgresql://crm_admin:pass@db.neon.tech:5432/crm"))
+        assertNull(ServerEndpointConfig.parse(""))
 
-        val parsed = PostgresConnectionConfig.parse(
-            "postgresql://crm_admin:my%40pass%2B1@db.neon.tech:5432/autosave_crm?sslmode=require"
+        // Trailing key=value path format (e.g. Render dashboard URL)
+        val pathAuth = ServerEndpointConfig.parse(
+            "https://auto-save-contacts-crm-akram-dashboard.onrender.com/mobile_api=vale"
         )
-        assertNotNull(parsed)
-        assertEquals("crm_admin", parsed!!.username)
-        assertEquals("my@pass+1", parsed.password)
-        assertEquals("db.neon.tech", parsed.host)
-        assertEquals(5432, parsed.port)
-        assertEquals("autosave_crm", parsed.database)
-        assertEquals(PostgresSslMode.REQUIRE, parsed.sslMode)
+        assertNotNull(pathAuth)
+        assertEquals("https://auto-save-contacts-crm-akram-dashboard.onrender.com/", pathAuth!!.baseUrl)
+        assertEquals("mobile_api", pathAuth.authParamName)
+        assertEquals("vale", pathAuth.authToken)
+        assertEquals(
+            "vale",
+            SubscriptionApiService.extractApiKey("https://auto-save-contacts-crm-akram-dashboard.onrender.com/mobile_api=vale")
+        )
+
+        // Query param format with optional prefix path
+        val queryAuth = ServerEndpointConfig.parse(
+            "https://auto-save-contacts-crm-akram-dashboard.onrender.com/v1?api_key=sec123"
+        )
+        assertNotNull(queryAuth)
+        assertEquals("https://auto-save-contacts-crm-akram-dashboard.onrender.com/v1/", queryAuth!!.baseUrl)
+        assertEquals("api_key", queryAuth.authParamName)
+        assertEquals("sec123", queryAuth.authToken)
+
+        // Root query param format
+        val rootQuery = ServerEndpointConfig.parse(
+            "https://auto-save-contacts-crm-akram-dashboard.onrender.com/?mobile_api=vale"
+        )
+        assertNotNull(rootQuery)
+        assertEquals("https://auto-save-contacts-crm-akram-dashboard.onrender.com/", rootQuery!!.baseUrl)
+        assertEquals("mobile_api", rootQuery.authParamName)
+        assertEquals("vale", rootQuery.authToken)
     }
 
     @Test
-    fun `offline or unconfigured postgres backend does not crash and prompts to contact owner`() = runTest {
+    fun `offline or unconfigured server backend does not crash and prompts to contact owner`() = runTest {
         val offlineApi = object : SubscriptionApiService {
             override suspend fun connectAndSyncUser(
                 authorization: String?,
                 apiKey: String?,
                 request: SubscriptionConnectRequest
             ): Response<SubscriptionApiResponse> {
-                throw IOException("Connection refused - PostgreSQL backend offline")
+                throw IOException("Connection refused - Server backend offline")
             }
 
             override suspend fun activateCode(
@@ -98,7 +117,7 @@ class SubscriptionManagerTest {
                 apiKey: String?,
                 request: SubscriptionActivateRequest
             ): Response<SubscriptionApiResponse> {
-                throw IOException("Connection refused - PostgreSQL backend offline")
+                throw IOException("Connection refused - Server backend offline")
             }
 
             override suspend fun verifySession(
@@ -920,132 +939,114 @@ class SubscriptionManagerTest {
     }
 
     @Test
-    fun `postgres gateway checks device existence first before inserting and updates by immutable device id`() = runTest {
-        val executedQueries = mutableListOf<Pair<String, List<String?>>>()
-        val storedUsers = mutableMapOf<String, MutableMap<String, String?>>()
+    fun `server API reconciles immutable device free tier usage and treats HTTP errors as disconnected`() = runTest {
+        Settings.Secure.putString(context.contentResolver, Settings.Secure.ANDROID_ID, "srv_hw_device_777")
+        var serverHttpCode = 200
+        var serverFreeUsed = 100
+        var serverFreeExhausted = true
+        val capturedRequests = mutableListOf<SubscriptionConnectRequest>()
 
-        val fakeConfig = PostgresConnectionConfig(
-            host = "localhost",
-            port = 5432,
-            database = "crm_test",
-            username = "crm",
-            password = "secret",
-            sslMode = PostgresSslMode.DISABLE
-        )
-
-        val gateway = PostgresSubscriptionGateway(fakeConfig) {
-            object : PostgresSqlExecutor {
-                override fun connect() {}
-                override fun close() {}
-                override fun executeSimple(sql: String): PostgresQueryResult =
-                    PostgresQueryResult(emptyList(), emptyList())
-
-                override fun query(sql: String, params: List<String?>): PostgresQueryResult {
-                    val normalized = sql.trim()
-                    executedQueries.add(normalized to params)
-
-                    return when {
-                        normalized.startsWith("SELECT user_id, device_id, android_id", ignoreCase = true) -> {
-                            val reqDeviceId = params.getOrNull(0).orEmpty()
-                            val reqAndroidId = params.getOrNull(1).orEmpty()
-                            val reqUserId = params.getOrNull(2).orEmpty()
-                            val matched = storedUsers.values.firstOrNull { row ->
-                                (row["device_id"] == reqDeviceId && reqDeviceId.isNotBlank()) ||
-                                    (row["android_id"] == reqAndroidId && reqAndroidId != "android_id_unavailable" && reqAndroidId.isNotBlank()) ||
-                                    row["user_id"] == reqUserId
-                            }
-                            PostgresQueryResult(emptyList(), if (matched != null) listOf(matched) else emptyList())
-                        }
-                        normalized.startsWith("INSERT INTO crm_users", ignoreCase = true) -> {
-                            val row = mutableMapOf<String, String?>(
-                                "user_id" to params[0],
-                                "device_id" to params[1],
-                                "android_id" to params[2],
-                                "install_uuid" to params[3],
-                                "public_ip" to params[4],
-                                "local_ip" to params[5],
-                                "saved_contacts_count" to params[10],
-                                "free_contacts_used" to params[11],
-                                "free_contacts_limit" to params[12],
-                                "free_tier_exhausted" to params[13],
-                                "plan_type" to params[14],
-                                "active_code" to params[15],
-                                "is_subscribed" to params[16]
-                            )
-                            storedUsers[params[0]!!] = row
-                            PostgresQueryResult(emptyList(), emptyList())
-                        }
-                        normalized.startsWith("UPDATE crm_users", ignoreCase = true) -> {
-                            val targetUserId = params[0]!!
-                            val row = storedUsers[targetUserId]
-                            if (row != null) {
-                                row["device_id"] = params[1]
-                                row["android_id"] = params[2]
-                                row["install_uuid"] = params[3]
-                                row["public_ip"] = params[4]
-                                row["local_ip"] = params[5]
-                                row["free_contacts_used"] = maxOf(
-                                    row["free_contacts_used"]?.toIntOrNull() ?: 0,
-                                    params[11]?.toIntOrNull() ?: 0
-                                ).toString()
-                                row["free_tier_exhausted"] = params[13]
-                                row["plan_type"] = params[14]
-                            }
-                            PostgresQueryResult(emptyList(), emptyList())
-                        }
-                        else -> PostgresQueryResult(emptyList(), emptyList())
-                    }
+        val serverApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                capturedRequests.add(request)
+                if (serverHttpCode != 200) {
+                    return Response.error(
+                        serverHttpCode,
+                        """{"error":"server error"}""".toResponseBody("application/json".toMediaType())
+                    )
                 }
+                return Response.success(
+                    SubscriptionApiResponse(
+                        valid = true,
+                        isSubscribed = false,
+                        isActive = true,
+                        freeContactsUsed = serverFreeUsed,
+                        freeContactsLimit = 100,
+                        freeTierExhausted = serverFreeExhausted,
+                        deviceId = request.deviceId
+                    )
+                )
             }
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = false))
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = false))
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun syncClients(
+                authorization: String?,
+                apiKey: String?,
+                request: ClientSyncBatchRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
         }
 
-        val initialSnapshot = UserNetworkSnapshot(
-            userId = "USR-IMMUTABLE01",
-            androidId = "hw_android_id_777",
-            installUuid = "install-uuid-first",
-            publicIp = "1.2.3.4",
-            localIp = "192.168.1.10",
-            locationInfo = "Sanaa",
-            deviceModel = "Pixel 8",
-            osVersion = "Android 15",
-            networkType = "Wi-Fi"
+        db.contactDao().insertContact(
+            Contact(
+                name = "عميل اختباري",
+                phone = "967770009999",
+                originalPhone = "+967770009999",
+                source = "واتساب",
+                interactionCount = 2,
+                isSyncedToPhone = true
+            )
         )
 
-        // 1. First connection: must SELECT first, see nothing, then INSERT once
-        gateway.connectAndSyncUser(
-            snapshot = initialSnapshot,
-            totalContacts = 5,
-            freeState = FreeAccessState(usedContacts = 5, limit = 100, isExhausted = false),
-            activeCode = null
-        )
+        val repo = SubscriptionRepository(db, apiServiceOverride = serverApi)
 
-        assertTrue(executedQueries[0].first.startsWith("SELECT user_id, device_id, android_id"))
-        assertTrue(executedQueries.any { it.first.startsWith("INSERT INTO crm_users") })
-        assertFalse(executedQueries.any { it.first.startsWith("UPDATE crm_users") })
-        assertEquals(1, storedUsers.size)
+        // 1. Non-2xx HTTP error (e.g. 404 / 401 / 500) must report Disconnected, NOT falsely Connected
+        serverHttpCode = 404
+        val err404Outcome = repo.verifyCurrentSession(context)
+        assertTrue(err404Outcome.dbStatus is DbConnectionStatus.Disconnected)
+        assertTrue(err404Outcome.isAllowed) // free tier <= 100 still allowed while disconnected
+        val errReport = err404Outcome.connectionReport
+        assertNotNull(errReport)
+        assertFalse(errReport!!.succeeded)
+        assertEquals(404, errReport.httpStatusCode)
+        assertEquals(1, errReport.localContactsCount)
+        assertEquals("عميل اختباري", errReport.sampleContacts.first().name)
 
-        // 2. App restarts / reinstalls (even if installUuid or publicIp changes) -> same immutable device ID
-        // Must SELECT first, find existing row, and UPDATE instead of inserting a duplicate
-        executedQueries.clear()
-        val restartedSnapshot = initialSnapshot.copy(
-            installUuid = "install-uuid-after-reinstall",
-            publicIp = "5.6.7.8",
-            networkType = "بيانات الهاتف"
-        )
-        val reconnectOutcome = gateway.connectAndSyncUser(
-            snapshot = restartedSnapshot,
-            totalContacts = 12,
-            freeState = FreeAccessState(usedContacts = 12, limit = 100, isExhausted = false),
-            activeCode = null
-        )
+        // 2. Server returns 200 OK with prior server-recorded free_tier_exhausted = true for this immutable device_id
+        serverHttpCode = 200
+        val syncedOutcome = repo.verifyCurrentSession(context)
+        assertTrue(syncedOutcome.dbStatus is DbConnectionStatus.Connected)
+        assertEquals("srv_hw_device_777", capturedRequests.last().deviceId)
+        assertEquals(UserIdentityManager.getStableUserId(context), capturedRequests.last().userId)
+        assertEquals(100, syncedOutcome.freeAccessState.usedContacts)
+        assertTrue(syncedOutcome.freeAccessState.isExhausted)
+        assertFalse(syncedOutcome.isAllowed)
+        assertFalse(repo.canSaveNewContact())
 
-        assertTrue(reconnectOutcome.connected)
-        assertEquals(12, reconnectOutcome.serverFreeUsed)
-        assertTrue(executedQueries[0].first.startsWith("SELECT user_id, device_id, android_id"))
-        assertFalse(executedQueries.any { it.first.startsWith("INSERT INTO crm_users") })
-        assertTrue(executedQueries.any { it.first.startsWith("UPDATE crm_users") })
-        assertEquals(1, storedUsers.size)
-        assertEquals("5.6.7.8", storedUsers["USR-IMMUTABLE01"]!!["public_ip"])
-        assertEquals("hw_android_id_777", storedUsers["USR-IMMUTABLE01"]!!["device_id"])
+        val okReport = syncedOutcome.connectionReport
+        assertNotNull(okReport)
+        assertTrue(okReport!!.succeeded)
+        assertEquals(200, okReport.httpStatusCode)
+        assertEquals(true, okReport.clientsSyncSucceeded)
+        assertEquals(100, okReport.freeContactsUsed)
+        assertTrue(okReport.freeTierExhausted)
+        assertEquals(1, okReport.localContactsCount)
+        assertTrue(okReport.rawServerResponse.contains("free_contacts_used"))
     }
 }

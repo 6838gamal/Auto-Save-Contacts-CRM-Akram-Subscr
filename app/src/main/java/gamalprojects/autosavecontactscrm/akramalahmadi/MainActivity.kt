@@ -43,7 +43,7 @@ class MainActivity : ComponentActivity() {
                         AutoSaveCrmApp(viewModel = crmViewModel)
                         DebugFab(
                             onClick = {
-                                startActivity(Intent(this, DebugConsoleActivity::class.java))
+                                startActivity(Intent(this@MainActivity, DebugConsoleActivity::class.java))
                             }
                         )
                     }

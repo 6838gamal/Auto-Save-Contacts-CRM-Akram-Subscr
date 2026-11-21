@@ -16,6 +16,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -326,14 +327,17 @@ fun SubscriptionGateScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            PostgresConnectionBadgeCard(
+            ServerConnectionBadgeCard(
                 dbStatus = dbStatus,
                 isBusy = isRefreshing || isVerifying,
                 onRetrySync = {
-                    subscriptionViewModel.syncConnectionAndUserData(onAutoUnlocked = {
+                    subscriptionViewModel.syncConnectionAndUserData(showPopup = true, onAutoUnlocked = {
                         Toast.makeText(context, "تم تفعيل اشتراكك بنجاح!", Toast.LENGTH_SHORT).show()
                         onUnlocked()
                     })
+                },
+                onShowDetails = {
+                    subscriptionViewModel.openConnectionDetailsDialog()
                 }
             )
 
@@ -806,10 +810,11 @@ fun SubscriptionGateScreen(
 }
 
 @Composable
-fun PostgresConnectionBadgeCard(
+fun ServerConnectionBadgeCard(
     dbStatus: DbConnectionStatus,
     isBusy: Boolean,
-    onRetrySync: () -> Unit
+    onRetrySync: () -> Unit,
+    onShowDetails: (() -> Unit)? = null
 ) {
     val (bgColor, accentColor, icon, title, subtitle) = when (dbStatus) {
         is DbConnectionStatus.Checking -> Tuple5(
@@ -824,7 +829,7 @@ fun PostgresConnectionBadgeCard(
             Color(0xFF10B981),
             Icons.Filled.CloudDone,
             "حالة الاتصال: متصل",
-            null
+            if (onShowDetails != null) "اضغط لعرض تفاصيل الاتصال ومحتوى قاعدة البيانات" else null
         )
         is DbConnectionStatus.Disconnected,
         is DbConnectionStatus.NotConfigured -> Tuple5(
@@ -832,7 +837,7 @@ fun PostgresConnectionBadgeCard(
             Color(0xFFF59E0B),
             Icons.Filled.CloudOff,
             "حالة الاتصال: غير متصل",
-            "تواصل مع الإدارة لمراجعة الأمر (${SubscriptionRepository.ADMIN_PHONE_DISPLAY})"
+            "تواصل مع الإدارة لمراجعة الأمر (${SubscriptionRepository.ADMIN_PHONE_DISPLAY}) • اضغط للتفاصيل"
         )
     }
 
@@ -842,7 +847,14 @@ fun PostgresConnectionBadgeCard(
         modifier = Modifier
             .fillMaxWidth()
             .border(1.dp, accentColor.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-            .testTag("postgres_connection_status_card")
+            .then(
+                if (onShowDetails != null) {
+                    Modifier.clickable { onShowDetails() }
+                } else {
+                    Modifier
+                }
+            )
+            .testTag("server_connection_status_card")
     ) {
         Row(
             modifier = Modifier
@@ -888,12 +900,27 @@ fun PostgresConnectionBadgeCard(
                     )
                 }
             }
+            if (onShowDetails != null) {
+                IconButton(
+                    onClick = onShowDetails,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("show_connection_details_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Info,
+                        contentDescription = "عرض تفاصيل الاتصال",
+                        tint = accentColor,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
             IconButton(
                 onClick = onRetrySync,
                 enabled = !isBusy,
                 modifier = Modifier
-                    .size(36.dp)
-                    .testTag("retry_postgres_sync_button")
+                    .minimumInteractiveComponentSize()
+                    .testTag("retry_server_sync_button")
             ) {
                 Icon(
                     imageVector = Icons.Filled.Refresh,
