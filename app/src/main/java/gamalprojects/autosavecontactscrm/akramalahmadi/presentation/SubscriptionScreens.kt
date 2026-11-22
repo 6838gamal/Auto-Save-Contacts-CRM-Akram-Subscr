@@ -80,6 +80,12 @@ fun SubscriptionGateScreen(
     val isConnectionError by subscriptionViewModel.isConnectionError.collectAsStateWithLifecycle()
     val freeAccessState by subscriptionViewModel.freeAccessState.collectAsStateWithLifecycle()
     val dbStatus by subscriptionViewModel.dbConnectionStatus.collectAsStateWithLifecycle()
+    val activeSubscription by subscriptionViewModel.activeSubscription.collectAsStateWithLifecycle()
+    val nowMillis by subscriptionViewModel.nowMillis.collectAsStateWithLifecycle()
+
+    val validActiveSub = activeSubscription?.takeIf {
+        !it.isExpired(nowMillis) && !it.isQuotaReached()
+    }
 
     var codeInput by remember { mutableStateOf("") }
 
@@ -210,7 +216,11 @@ fun SubscriptionGateScreen(
             Spacer(modifier = Modifier.height(14.dp))
 
             Text(
-                text = stringResource(R.string.title_subscription_gate),
+                text = if (validActiveSub != null) {
+                    "أنت بالفعل مشترك"
+                } else {
+                    stringResource(R.string.title_subscription_gate)
+                },
                 fontSize = 23.sp,
                 fontWeight = FontWeight.ExtraBold,
                 color = MaterialTheme.colorScheme.onBackground,
@@ -220,18 +230,22 @@ fun SubscriptionGateScreen(
             Spacer(modifier = Modifier.height(6.dp))
 
             Text(
-                text = if (freeAccessState.isExhausted) {
-                    "وصلت إلى الحد المجاني (${freeAccessState.usedContacts} / ${freeAccessState.limit} جهة اتصال). أدخل كود اشتراك صحيح للمتابعة."
-                } else {
-                    stringResource(R.string.subtitle_subscription_gate)
+                text = when {
+                    validActiveSub != null ->
+                        "اشتراكك الحالي فعّال (${validActiveSub.planTier.displayTitle}) ولا يلزم إدخال أي كود طالما الاشتراك ساري المفعول."
+                    freeAccessState.isExhausted ->
+                        "وصلت إلى الحد المجاني (${freeAccessState.usedContacts} / ${freeAccessState.limit} جهة اتصال). أدخل كود اشتراك (5 أشهر أو 12 شهراً) للمتابعة."
+                    else ->
+                        "أنت حالياً على الخطة المجانية المحدودة (${freeAccessState.usedContacts} / ${freeAccessState.limit} • متبقي ${freeAccessState.remainingContacts} جهة اتصال). لتفعيل الباقة أدخل كود 5 أشهر أو 12 شهراً."
                 },
                 fontSize = 12.sp,
-                color = if (freeAccessState.isExhausted) {
-                    Color(0xFFF59E0B)
-                } else {
-                    MaterialTheme.colorScheme.onBackground.copy(alpha = 0.75f)
+                color = when {
+                    validActiveSub != null -> Color(0xFF10B981)
+                    freeAccessState.isExhausted -> Color(0xFFEF4444)
+                    freeAccessState.usedContacts >= (freeAccessState.limit * 0.7f) -> Color(0xFFF59E0B)
+                    else -> MaterialTheme.colorScheme.onBackground.copy(alpha = 0.78f)
                 },
-                fontWeight = if (freeAccessState.isExhausted) FontWeight.Bold else FontWeight.Normal,
+                fontWeight = if (validActiveSub != null || freeAccessState.isExhausted) FontWeight.Bold else FontWeight.Medium,
                 textAlign = TextAlign.Center,
                 lineHeight = 18.sp
             )
@@ -339,13 +353,30 @@ fun SubscriptionGateScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Code Entry Card
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
+            if (validActiveSub != null) {
+                AlreadySubscribedCountdownCard(
+                    info = validActiveSub,
+                    nowMillis = nowMillis,
+                    onContinueClick = {
+                        if (onNavigateBack != null && canNavigateBack) {
+                            onNavigateBack()
+                        } else {
+                            onUnlocked()
+                        }
+                    }
+                )
+            } else {
+                FreeTierSensitivityCard(freeState = freeAccessState)
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Code Entry Card (shown ONLY when no active valid subscription exists)
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                 Column(modifier = Modifier.padding(18.dp)) {
                     Text(
                         text = stringResource(R.string.label_subscription_code),
@@ -584,6 +615,7 @@ fun SubscriptionGateScreen(
                         }
                     }
                 }
+            }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -915,6 +947,226 @@ private data class Tuple5<A, B, C, D, E>(
 )
 
 @Composable
+fun FreeTierSensitivityCard(freeState: FreeAccessState) {
+    val progress = (freeState.usedContacts.toFloat() / freeState.limit.toFloat()).coerceIn(0f, 1f)
+    val accentColor = when {
+        freeState.isExhausted -> Color(0xFFEF4444)
+        freeState.usedContacts >= (freeState.limit * 0.9f) -> Color(0xFFEF4444)
+        freeState.usedContacts >= (freeState.limit * 0.7f) -> Color(0xFFF59E0B)
+        else -> MaterialTheme.colorScheme.primary
+    }
+    val statusHeadline = when {
+        freeState.isExhausted -> "نفد الحد المجاني بالكامل (100 / 100)"
+        freeState.usedContacts >= (freeState.limit * 0.9f) ->
+            "تحذير حرج: متبقي ${freeState.remainingContacts} جهة اتصال فقط!"
+        freeState.usedContacts >= (freeState.limit * 0.7f) ->
+            "تنبيه: اقتربت من نهاية الرصيد المجاني (متبقي ${freeState.remainingContacts})"
+        else -> "الخطة المجانية المحدودة: متبقي ${freeState.remainingContacts} من أصل ${freeState.limit}"
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = accentColor.copy(alpha = 0.08f)),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.2.dp, accentColor.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+            .testTag("free_tier_sensitivity_card")
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(
+                        imageVector = if (freeState.isExhausted) Icons.Filled.Lock else Icons.Filled.HourglassBottom,
+                        contentDescription = null,
+                        tint = accentColor,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = statusHeadline,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = accentColor
+                    )
+                }
+                Text(
+                    text = "${freeState.usedContacts}/${freeState.limit}",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontFamily = FontFamily.Monospace,
+                    color = accentColor
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp)),
+                color = accentColor,
+                trackColor = accentColor.copy(alpha = 0.16f)
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "المتاح في الوضع المجاني حتى ${freeState.limit} جهة اتصال فقط، وبعدها يلزم كود اشتراك (5 أشهر أو 12 شهراً).",
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                lineHeight = 14.sp
+            )
+        }
+    }
+}
+
+@Composable
+fun AlreadySubscribedCountdownCard(
+    info: ActiveSubscriptionInfo,
+    nowMillis: Long,
+    onContinueClick: () -> Unit
+) {
+    val accentColor = resolveUrgencyColor(info.expiresAt, nowMillis)
+    val parts = computeCountdownParts(info.expiresAt, nowMillis)
+    val expiryFormatted = remember(info.expiresAt) {
+        info.expiresAt?.let {
+            java.text.SimpleDateFormat("yyyy/MM/dd - HH:mm", java.util.Locale("ar")).format(java.util.Date(it))
+        } ?: "غير محدد"
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+        shape = RoundedCornerShape(20.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.5.dp, Color(0xFF10B981).copy(alpha = 0.55f), RoundedCornerShape(20.dp))
+            .testTag("already_subscribed_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Filled.Verified,
+                        contentDescription = "أنت بالفعل مشترك",
+                        tint = Color(0xFF10B981),
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "أنت بالفعل مشترك",
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color(0xFF10B981)
+                    )
+                }
+                Surface(
+                    color = Color(0xFF10B981).copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = info.planTier.displayTitle,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF10B981),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Text(
+                text = "حالة الكود سارية ولا حاجة لإدخال أي كود جديد. فيما يلي العداد التنازلي للمدة المتبقية قبل انتهاء الاشتراك:",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f),
+                textAlign = TextAlign.Center,
+                lineHeight = 18.sp
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            CountdownSegmentsRow(parts = parts, accentColor = accentColor)
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            LinearProgressIndicator(
+                progress = { info.remainingProgress(nowMillis) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(7.dp)
+                    .clip(RoundedCornerShape(4.dp)),
+                color = accentColor,
+                trackColor = accentColor.copy(alpha = 0.15f)
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            IdentityInfoRow(
+                label = "تاريخ انتهاء الاشتراك",
+                value = expiryFormatted,
+                isMonospace = false
+            )
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color.Gray.copy(alpha = 0.15f))
+            IdentityInfoRow(
+                label = "الباقة / الكود",
+                value = "${info.planTier.displayTitle} (${info.code})",
+                isMonospace = false
+            )
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color.Gray.copy(alpha = 0.15f))
+            val max = info.maxContacts
+            IdentityInfoRow(
+                label = "العملاء المحفوظون",
+                value = if (max != null && max > 0) "${info.usedContacts} / $max (متبقي ${info.remainingContacts()})" else "${info.usedContacts} محفوظ (ضمن الاشتراك)",
+                isMonospace = false
+            )
+
+            val urgencyBanner = resolveUrgencyMessage(info.expiresAt, nowMillis)
+            if (urgencyBanner != null) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Surface(
+                    color = accentColor.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = urgencyBanner,
+                        color = accentColor,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(
+                onClick = onContinueClick,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("already_subscribed_continue_button")
+            ) {
+                Icon(Icons.Filled.Dashboard, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("العودة إلى لوحة التحكم", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            }
+        }
+    }
+}
+
+@Composable
 fun FreeUsageStatusCard(
     freeState: FreeAccessState,
     onActivateCodeClick: () -> Unit
@@ -923,7 +1175,13 @@ fun FreeUsageStatusCard(
     val adminPhoneDisplay = SubscriptionRepository.ADMIN_PHONE_DISPLAY
     val adminPhoneDigits = SubscriptionRepository.ADMIN_PHONE_DIGITS
     val progress = (freeState.usedContacts.toFloat() / freeState.limit.toFloat()).coerceIn(0f, 1f)
-    val isNearLimit = freeState.usedContacts >= (freeState.limit * 0.8f)
+    val accentColor = when {
+        freeState.isExhausted -> Color(0xFFEF4444)
+        freeState.usedContacts >= (freeState.limit * 0.9f) -> Color(0xFFEF4444)
+        freeState.usedContacts >= (freeState.limit * 0.7f) -> Color(0xFFF59E0B)
+        else -> MaterialTheme.colorScheme.primary
+    }
+    val isWarningTier = freeState.usedContacts >= (freeState.limit * 0.7f)
 
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -932,8 +1190,8 @@ fun FreeUsageStatusCard(
         modifier = Modifier
             .fillMaxWidth()
             .border(
-                width = 1.dp,
-                color = if (isNearLimit) Color(0xFFF59E0B).copy(alpha = 0.55f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.3f),
+                width = 1.2.dp,
+                color = accentColor.copy(alpha = if (isWarningTier) 0.6f else 0.3f),
                 shape = RoundedCornerShape(18.dp)
             )
     ) {
@@ -948,28 +1206,26 @@ fun FreeUsageStatusCard(
                         modifier = Modifier
                             .size(40.dp)
                             .clip(CircleShape)
-                            .background(
-                                (if (isNearLimit) Color(0xFFF59E0B) else MaterialTheme.colorScheme.primary).copy(alpha = 0.14f)
-                            ),
+                            .background(accentColor.copy(alpha = 0.14f)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = Icons.Filled.LockOpen,
+                            imageVector = if (isWarningTier) Icons.Filled.Warning else Icons.Filled.HourglassTop,
                             contentDescription = null,
-                            tint = if (isNearLimit) Color(0xFFF59E0B) else MaterialTheme.colorScheme.primary
+                            tint = accentColor
                         )
                     }
                     Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
-                            text = "الوصول المجاني المبدئي",
+                            text = "حساب مجاني محدود (غير مشترك)",
                             fontWeight = FontWeight.Bold,
                             fontSize = 14.sp
                         )
                         Text(
-                            text = "متاح حفظ حتى ${freeState.limit} جهة اتصال مجاناً",
+                            text = "الحد الأقصى المجاني ${freeState.limit} جهة اتصال فقط (باقات التفعيل: 5 أشهر أو 12 شهراً)",
                             fontSize = 11.sp,
-                            color = Color.Gray
+                            color = if (isWarningTier) accentColor else Color.Gray
                         )
                     }
                 }
@@ -981,12 +1237,12 @@ fun FreeUsageStatusCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(text = "الأرقام المحفوظة:", fontSize = 12.sp, color = Color.Gray)
+                Text(text = "الاستهلاك المجاني:", fontSize = 12.sp, color = Color.Gray)
                 Text(
                     text = "${freeState.usedContacts} / ${freeState.limit} (متبقي ${freeState.remainingContacts})",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    color = if (isNearLimit) Color(0xFFF59E0B) else MaterialTheme.colorScheme.primary
+                    color = accentColor
                 )
             }
 
@@ -997,9 +1253,22 @@ fun FreeUsageStatusCard(
                     .fillMaxWidth()
                     .height(7.dp)
                     .clip(RoundedCornerShape(4.dp)),
-                color = if (isNearLimit) Color(0xFFF59E0B) else MaterialTheme.colorScheme.primary,
-                trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                color = accentColor,
+                trackColor = accentColor.copy(alpha = 0.14f)
             )
+            if (isWarningTier) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = if (freeState.isExhausted) {
+                        "انتهى الحد المجاني تماماً! يرجى تفعيل كود اشتراك (5 أشهر أو 12 شهراً) للاستمرار."
+                    } else {
+                        "تنبيه: أوشك الرصيد المجاني على النفاد — متبقي ${freeState.remainingContacts} جهة اتصال فقط قبل القفل."
+                    },
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = accentColor
+                )
+            }
 
             Spacer(modifier = Modifier.height(14.dp))
 
@@ -1084,19 +1353,23 @@ fun FreeUsageStatusCard(
 @Composable
 fun SubscriptionStatusCard(
     info: ActiveSubscriptionInfo?,
-    nowMillis: Long,
-    onSwitchCode: () -> Unit
+    nowMillis: Long
 ) {
     if (info == null) return
     val context = LocalContext.current
     val adminPhoneDisplay = SubscriptionRepository.ADMIN_PHONE_DISPLAY
-    val remainingText = formatRemainingDuration(info.expiresAt, info.isLifetime, nowMillis)
+    val accentColor = resolveUrgencyColor(info.expiresAt, nowMillis)
+    val parts = computeCountdownParts(info.expiresAt, nowMillis)
+    val urgencyBanner = resolveUrgencyMessage(info.expiresAt, nowMillis)
 
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         shape = RoundedCornerShape(18.dp),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, Color(0xFF10B981).copy(alpha = 0.4f), RoundedCornerShape(18.dp))
+            .testTag("active_subscription_status_card")
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(
@@ -1109,35 +1382,80 @@ fun SubscriptionStatusCard(
                         modifier = Modifier
                             .size(40.dp)
                             .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)),
+                            .background(Color(0xFF10B981).copy(alpha = 0.14f)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Verified,
                             contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary
+                            tint = Color(0xFF10B981)
                         )
                     }
                     Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
-                            text = "حالة الاشتراك: نشط",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
+                            text = "أنت بالفعل مشترك",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 15.sp,
+                            color = Color(0xFF10B981)
                         )
                         Text(
-                            text = "${info.label} (${info.code})",
+                            text = "${info.planTier.displayTitle} • ${info.code}",
                             fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.primary,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
                             fontFamily = FontFamily.Monospace
                         )
                     }
                 }
-                TextButton(
-                    onClick = onSwitchCode,
-                    modifier = Modifier.testTag("switch_subscription_code_button")
+                Surface(
+                    color = Color(0xFF10B981).copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(8.dp)
                 ) {
-                    Text("تبديل الكود", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "الكود ساري",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF10B981),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "المدة المتبقية قبل انتهاء الاشتراك:",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            CountdownSegmentsRow(parts = parts, accentColor = accentColor)
+
+            Spacer(modifier = Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = { info.remainingProgress(nowMillis) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp)),
+                color = accentColor,
+                trackColor = accentColor.copy(alpha = 0.14f)
+            )
+
+            if (urgencyBanner != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    color = accentColor.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = urgencyBanner,
+                        color = accentColor,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(8.dp)
+                    )
                 }
             }
 
@@ -1149,39 +1467,48 @@ fun SubscriptionStatusCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(text = "حالة التفعيل:", fontSize = 12.sp, color = Color.Gray)
+                Text(text = "حفظ العملاء:", fontSize = 12.sp, color = Color.Gray)
+                val max = info.maxContacts
                 Text(
-                    text = "اشتراك مفعل",
+                    text = if (max != null && max > 0) {
+                        "${info.usedContacts} / $max جهة اتصال"
+                    } else {
+                        "فعّال خلال مدة الاشتراك (${info.usedContacts} محفوظ)"
+                    },
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (max != null && max > 0 && info.usedContacts >= (max * 0.9)) Color(0xFFF59E0B) else MaterialTheme.colorScheme.onSurface
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(text = "نوع الباقة:", fontSize = 12.sp, color = Color.Gray)
+                Text(
+                    text = info.planTier.displayTitle,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
             }
             Spacer(modifier = Modifier.height(6.dp))
+            val expiryFormatted = remember(info.expiresAt) {
+                info.expiresAt?.let {
+                    java.text.SimpleDateFormat("yyyy/MM/dd - HH:mm", java.util.Locale("ar")).format(java.util.Date(it))
+                } ?: "غير محدد"
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(text = "حد الحفظ المسموح:", fontSize = 12.sp, color = Color.Gray)
-                val max = info.maxContacts
+                Text(text = "ينتهي في:", fontSize = 12.sp, color = Color.Gray)
                 Text(
-                    text = if (max != null && max > 0) "${info.usedContacts} / $max جهة اتصال" else "غير محدود (${info.usedContacts} محفوظة)",
+                    text = expiryFormatted,
                     fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (max != null && max > 0 && info.usedContacts >= (max * 0.9)) Color(0xFFF59E0B) else MaterialTheme.colorScheme.onSurface
-                )
-            }
-            val maxQuota = info.maxContacts
-            if (maxQuota != null && maxQuota > 0) {
-                Spacer(modifier = Modifier.height(6.dp))
-                LinearProgressIndicator(
-                    progress = { (info.usedContacts.toFloat() / maxQuota.toFloat()).coerceIn(0f, 1f) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(6.dp)
-                        .clip(RoundedCornerShape(3.dp)),
-                    color = if (info.usedContacts >= (maxQuota * 0.9)) Color(0xFFF59E0B) else MaterialTheme.colorScheme.primary,
-                    trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                    fontWeight = FontWeight.SemiBold,
+                    color = accentColor
                 )
             }
             Spacer(modifier = Modifier.height(6.dp))
@@ -1189,35 +1516,9 @@ fun SubscriptionStatusCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(text = "المدة المتبقية:", fontSize = 12.sp, color = Color.Gray)
-                Text(
-                    text = remainingText,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.tertiary
-                )
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(text = "معرف المستخدم:", fontSize = 12.sp, color = Color.Gray)
+                Text(text = "معرف الجهاز / المستخدم:", fontSize = 12.sp, color = Color.Gray)
                 Text(
                     text = info.boundUserId,
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(text = "عنوان IP المسجل:", fontSize = 12.sp, color = Color.Gray)
-                Text(
-                    text = info.boundIpAddress,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.SemiBold
@@ -1246,6 +1547,96 @@ fun SubscriptionStatusCard(
                 }
             }
         }
+    }
+}
+
+data class CountdownParts(
+    val days: Long,
+    val hours: Long,
+    val minutes: Long,
+    val seconds: Long,
+    val isExpired: Boolean
+)
+
+fun computeCountdownParts(expiresAt: Long?, now: Long): CountdownParts {
+    if (expiresAt == null) return CountdownParts(0, 0, 0, 0, true)
+    val diff = expiresAt - now
+    if (diff <= 0L) return CountdownParts(0, 0, 0, 0, true)
+    val totalSeconds = diff / 1000L
+    val days = totalSeconds / 86_400L
+    val hours = (totalSeconds % 86_400L) / 3_600L
+    val minutes = (totalSeconds % 3_600L) / 60L
+    val seconds = totalSeconds % 60L
+    return CountdownParts(days, hours, minutes, seconds, false)
+}
+
+@Composable
+private fun CountdownSegmentsRow(parts: CountdownParts, accentColor: Color) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("subscription_countdown_timer"),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        CountdownUnitBox(value = parts.days, unit = "يوم", accentColor = accentColor, modifier = Modifier.weight(1f))
+        CountdownUnitBox(value = parts.hours, unit = "ساعة", accentColor = accentColor, modifier = Modifier.weight(1f))
+        CountdownUnitBox(value = parts.minutes, unit = "دقيقة", accentColor = accentColor, modifier = Modifier.weight(1f))
+        CountdownUnitBox(value = parts.seconds, unit = "ثانية", accentColor = accentColor, modifier = Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun CountdownUnitBox(
+    value: Long,
+    unit: String,
+    accentColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = accentColor.copy(alpha = 0.11f),
+        shape = RoundedCornerShape(12.dp),
+        modifier = modifier.border(1.dp, accentColor.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+    ) {
+        Column(
+            modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = value.toString().padStart(2, '0'),
+                fontSize = 18.sp,
+                fontWeight = FontWeight.ExtraBold,
+                fontFamily = FontFamily.Monospace,
+                color = accentColor
+            )
+            Text(
+                text = unit,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
+            )
+        }
+    }
+}
+
+private fun resolveUrgencyColor(expiresAt: Long?, now: Long): Color {
+    if (expiresAt == null) return Color(0xFFEF4444)
+    val diffHours = (expiresAt - now) / 3_600_000L
+    return when {
+        diffHours <= 24L -> Color(0xFFEF4444)
+        diffHours <= 24L * 7L -> Color(0xFFF59E0B)
+        else -> Color(0xFF10B981)
+    }
+}
+
+private fun resolveUrgencyMessage(expiresAt: Long?, now: Long): String? {
+    if (expiresAt == null) return "انتهت مدة الاشتراك الحالية."
+    val diff = expiresAt - now
+    if (diff <= 0L) return "انتهت مدة الاشتراك الحالية."
+    val hours = diff / 3_600_000L
+    return when {
+        hours <= 24L -> "تنبيه عاجل: تبقّى أقل من 24 ساعة على انتهاء الاشتراك!"
+        hours <= 24L * 7L -> "تنبيه: اشتراكك ينتهي خلال أقل من 7 أيام. بادر بالتجديد قبل التوقف."
+        else -> null
     }
 }
 
@@ -1292,16 +1683,12 @@ fun copyToClipboard(context: Context, label: String, text: String) {
 }
 
 fun formatRemainingDuration(expiresAt: Long?, isLifetime: Boolean, now: Long): String {
-    if (isLifetime || expiresAt == null) return "مفتوح (مدى الحياة)"
-    val diff = expiresAt - now
-    if (diff <= 0L) return "منتهي"
-    val totalMinutes = diff / 60_000L
-    val days = totalMinutes / 1440L
-    val hours = (totalMinutes % 1440L) / 60L
-    val mins = totalMinutes % 60L
+    if (expiresAt == null) return "غير محدد - يرجى مراجعة الإدارة"
+    val parts = computeCountdownParts(expiresAt, now)
+    if (parts.isExpired) return "منتهي الصلاحية"
     return when {
-        days > 0 -> "$days يوم و $hours ساعة"
-        hours > 0 -> "$hours ساعة و $mins دقيقة"
-        else -> "$mins دقيقة"
+        parts.days > 0 -> "${parts.days} يوم و ${parts.hours} ساعة و ${parts.minutes} دقيقة"
+        parts.hours > 0 -> "${parts.hours} ساعة و ${parts.minutes} دقيقة و ${parts.seconds} ثانية"
+        else -> "${parts.minutes} دقيقة و ${parts.seconds} ثانية"
     }
 }

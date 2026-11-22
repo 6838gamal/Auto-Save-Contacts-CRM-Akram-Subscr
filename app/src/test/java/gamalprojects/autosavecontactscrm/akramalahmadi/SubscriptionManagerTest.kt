@@ -6,6 +6,8 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.Contact
+import gamalprojects.autosavecontactscrm.akramalahmadi.database.SettingEntity
+import gamalprojects.autosavecontactscrm.akramalahmadi.database.SubscriptionCodeEntity
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserIdentityManager
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.UserNetworkSnapshot
 import gamalprojects.autosavecontactscrm.akramalahmadi.network.ClientSyncBatchRequest
@@ -1032,5 +1034,235 @@ class SubscriptionManagerTest {
         assertTrue(syncedOutcome.freeAccessState.isExhausted)
         assertFalse(syncedOutcome.isAllowed)
         assertFalse(repo.canSaveNewContact())
+    }
+
+    @Test
+    fun `supports 5 month and 12 month subscription plans and rejects missing expiry without lifetime claim`() = runTest {
+        var mode = "MISSING_EXPIRY"
+        val now = System.currentTimeMillis()
+        val api = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> {
+                return when (mode) {
+                    "MISSING_EXPIRY" -> Response.success(
+                        SubscriptionApiResponse(
+                            valid = true,
+                            isSubscribed = true,
+                            isActive = true,
+                            isLifetime = true,
+                            code = request.code
+                        )
+                    )
+                    "5_MONTHS" -> Response.success(
+                        SubscriptionApiResponse(
+                            valid = true,
+                            isSubscribed = true,
+                            isActive = true,
+                            code = request.code,
+                            planType = "5_months",
+                            durationMonths = 5,
+                            activatedAt = now
+                        )
+                    )
+                    else -> Response.success(
+                        SubscriptionApiResponse(
+                            valid = true,
+                            isSubscribed = true,
+                            isActive = true,
+                            code = request.code,
+                            planType = "12_months",
+                            durationMonths = 12,
+                            activatedAt = now
+                        )
+                    )
+                }
+            }
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true, isSubscribed = true, isActive = true))
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun syncClients(
+                authorization: String?,
+                apiKey: String?,
+                request: ClientSyncBatchRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+        }
+
+        val repo = SubscriptionRepository(db, apiServiceOverride = api)
+
+        // 1. Missing duration/expiry even with isLifetime=true must be strictly rejected
+        mode = "MISSING_EXPIRY"
+        val rejected = repo.activateSubscriptionCode(context, "NO-DURATION-CODE")
+        assertTrue(rejected is ActivationResult.Failure)
+
+        // 2. 5-month code resolves strictly to FIVE_MONTHS with finite ~5 month expiry
+        mode = "5_MONTHS"
+        val res5 = repo.activateSubscriptionCode(context, "PLAN-5M-CODE")
+        assertTrue(res5 is ActivationResult.Success)
+        val info5 = (res5 as ActivationResult.Success).info
+        assertEquals(gamalprojects.autosavecontactscrm.akramalahmadi.repositories.SubscriptionPlanTier.FIVE_MONTHS, info5.planTier)
+        assertFalse(info5.isLifetime)
+        assertNotNull(info5.expiresAt)
+        val days5 = (info5.expiresAt!! - info5.activatedAt) / 86_400_000L
+        assertTrue("Expected ~150 days for 5 months, got $days5", days5 in 148L..155L)
+
+        // 3. 12-month code resolves strictly to TWELVE_MONTHS with finite ~12 month expiry
+        mode = "12_MONTHS"
+        val res12 = repo.activateSubscriptionCode(context, "PLAN-12M-CODE")
+        assertTrue(res12 is ActivationResult.Success)
+        val info12 = (res12 as ActivationResult.Success).info
+        assertEquals(gamalprojects.autosavecontactscrm.akramalahmadi.repositories.SubscriptionPlanTier.TWELVE_MONTHS, info12.planTier)
+        assertFalse(info12.isLifetime)
+        assertNotNull(info12.expiresAt)
+        val days12 = (info12.expiresAt!! - info12.activatedAt) / 86_400_000L
+        assertTrue("Expected ~365 days for 12 months, got $days12", days12 in 364L..367L)
+    }
+
+    @Test
+    fun `contact and audit logs never duplicate the same phone number across formats or repeated triggers`() = runTest {
+        val contactsRepo = ContactsRepository(db)
+        val subRepo = SubscriptionRepository(db)
+
+        // First trigger saves contact and logs once
+        val firstSaved = contactsRepo.processNewConnection(context, "+967 777 123 456", "واتساب", "مرحبا")
+        assertTrue(firstSaved)
+
+        // Repeated triggers with varied formats (00967, local 0, plain 9 digits, Arabic numerals) must NEVER duplicate
+        assertFalse(contactsRepo.processNewConnection(context, "00967777123456", "مكالمة واردة", "مكالمة"))
+        assertFalse(contactsRepo.processNewConnection(context, "0777123456", "رسالة SMS", "رسالة"))
+        assertFalse(contactsRepo.processNewConnection(context, "777123456", "خدمة إمكانية الوصول", "شاشة"))
+        assertFalse(contactsRepo.processNewConnection(context, "٧٧٧١٢٣٤٥٦", "واتساب", "رسالة ثانية"))
+
+        val contacts = db.contactDao().getAllContactsSync()
+        val logs = db.logEntryDao().getAllLogsSync()
+        val events = db.phoneEventDao().getAllEventsSync()
+        val freeState = subRepo.getFreeAccessStateSync()
+
+        assertEquals(1, contacts.size)
+        assertEquals("777123456", contacts.single().phone)
+        assertEquals(1, logs.size)
+        assertEquals(1, events.size)
+        assertEquals(1, freeState.usedContacts)
+    }
+
+    @Test
+    fun `parses ISO-8601 expires_at from server JSON and unlocks when admin renews expired local code`() = runTest {
+        val moshi = com.squareup.moshi.Moshi.Builder()
+            .add(gamalprojects.autosavecontactscrm.akramalahmadi.network.FlexibleLongAdapterFactory())
+            .build()
+        val adapter = moshi.adapter(SubscriptionApiResponse::class.java)
+        val json = """
+            {
+              "valid": true,
+              "is_subscribed": true,
+              "is_active": true,
+              "code": "ISO-12M-CODE",
+              "code_type": "12 months",
+              "activated_at": "2026-11-22T10:00:00.000Z",
+              "expires_at": "2027-11-22T10:00:00Z"
+            }
+        """.trimIndent()
+        val parsed = adapter.fromJson(json)
+        assertNotNull(parsed)
+        assertNotNull(parsed!!.activatedAt)
+        assertNotNull(parsed.expiresAt)
+        assertTrue(parsed.expiresAt!! > parsed.activatedAt!!)
+
+        // Seed an EXPIRED cached subscription in Room
+        val past = System.currentTimeMillis() - 86_400_000L
+        db.subscriptionCodeDao().upsertCode(
+            SubscriptionCodeEntity(
+                code = "EXPIRED-5M",
+                label = "باقة 5 أشهر",
+                durationMinutes = 216_000L,
+                isLifetime = false,
+                isSubscribed = true,
+                isActive = true,
+                activatedAt = past - 1_000_000L,
+                expiresAt = past
+            )
+        )
+        db.settingDao().insertSetting(SettingEntity("active_subscription_code", "EXPIRED-5M"))
+
+        // Server returns renewed 5-month code during connectAndSyncUser
+        val futureExpiry = System.currentTimeMillis() + 150L * 86_400_000L
+        val renewalApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> = Response.success(
+                SubscriptionApiResponse(
+                    valid = true,
+                    isSubscribed = true,
+                    isActive = true,
+                    code = "RENEWED-5M",
+                    plan = "5 months",
+                    expiresAt = futureExpiry
+                )
+            )
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse())
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse())
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun syncClients(
+                authorization: String?,
+                apiKey: String?,
+                request: ClientSyncBatchRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+        }
+
+        val repo = SubscriptionRepository(db, apiServiceOverride = renewalApi)
+        val outcome = repo.verifyCurrentSession(context)
+        assertTrue(outcome.isAllowed)
+        assertNotNull(outcome.activeInfo)
+        assertEquals("RENEWED-5M", outcome.activeInfo!!.code)
+        assertEquals(gamalprojects.autosavecontactscrm.akramalahmadi.repositories.SubscriptionPlanTier.FIVE_MONTHS, outcome.activeInfo!!.planTier)
+        assertTrue(repo.canSaveNewContact())
     }
 }

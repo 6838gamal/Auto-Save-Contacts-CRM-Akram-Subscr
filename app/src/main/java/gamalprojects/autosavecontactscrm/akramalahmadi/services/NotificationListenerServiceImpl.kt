@@ -5,15 +5,18 @@ import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
+import gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ContactsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
 class NotificationListenerServiceImpl : NotificationListenerService() {
 
     private val scope = CoroutineScope(Dispatchers.IO)
     private lateinit var repo: ContactsRepository
+    private val recentlyProcessed = ConcurrentHashMap<String, Long>()
 
     override fun onCreate() {
         super.onCreate()
@@ -35,14 +38,23 @@ class NotificationListenerServiceImpl : NotificationListenerService() {
 
             val potentialPhone = extractPhoneNumber(title)
             if (potentialPhone != null) {
-                Log.d("NotificationListener", "Found WhatsApp phone number to parse: $potentialPhone")
-                scope.launch {
-                    repo.processNewConnection(
-                        applicationContext,
-                        potentialPhone,
-                        "واتساب",
-                        "رسالة واتساب: ${text.take(60)}"
-                    )
+                val normalized = PhoneNumberUtils.normalize(potentialPhone)
+                val now = System.currentTimeMillis()
+                val lastSeen = recentlyProcessed[normalized]
+                if (normalized.length >= 7 && (lastSeen == null || (now - lastSeen) >= 60_000L)) {
+                    recentlyProcessed[normalized] = now
+                    if (recentlyProcessed.size > 500) {
+                        recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
+                    }
+                    Log.d("NotificationListener", "Found WhatsApp phone number to parse: $potentialPhone")
+                    scope.launch {
+                        repo.processNewConnection(
+                            applicationContext,
+                            potentialPhone,
+                            "واتساب",
+                            "رسالة واتساب: ${text.take(60)}"
+                        )
+                    }
                 }
             } else {
                 Log.d("NotificationListener", "WhatsApp Notification Title contains letters or short, ignoring (probably saved contact): $title")

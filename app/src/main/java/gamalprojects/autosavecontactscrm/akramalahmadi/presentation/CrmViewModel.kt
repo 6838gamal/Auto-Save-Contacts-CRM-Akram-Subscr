@@ -14,6 +14,7 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ContactsRepo
 import gamalprojects.autosavecontactscrm.akramalahmadi.services.AutoSaveForegroundService
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 
 class CrmViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -225,37 +226,50 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
             val account = _gmailAccount.value
             val imported = gamalprojects.autosavecontactscrm.akramalahmadi.managers.ContactsManager.importFromGoogleContacts(getApplication(), if (account.isBlank()) null else account)
             var count = 0
-            for ((name, phone) in imported) {
-                if (!subscriptionRepo.canSaveNewContact()) {
-                    break
-                }
-                val normalized = gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils.normalize(phone)
-                val existing = db.contactDao().getContactByPhone(normalized)
-                if (existing == null) {
-                    val nextId = db.settingDao().getSetting("next_customer_id")?.value?.toIntOrNull() ?: 1
-                    val clientName = "عميل $nextId"
-                    val newContact = Contact(
-                        name = clientName,
-                        phone = normalized,
-                        originalPhone = phone,
-                        source = "واتساب",
-                        isSyncedToPhone = true
-                    )
-                    db.contactDao().insertContact(newContact)
-                    db.settingDao().insertSetting(SettingEntity("next_customer_id", (nextId + 1).toString()))
-
-                    db.logEntryDao().insertLog(
-                        LogEntry(
-                            phone = phone,
-                            source = "استيراد من جمايل",
-                            status = "تم الاستيراد",
-                            details = "تم استيراد جهة الاتصال: $name وحفظه كعميل: $clientName"
+            ContactsRepository.saveMutex.withLock {
+                for ((name, phone) in imported) {
+                    if (!subscriptionRepo.canSaveNewContact()) {
+                        break
+                    }
+                    val normalized = gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils.normalize(phone)
+                    if (normalized.length < 7) continue
+                    val existing = db.contactDao().getContactByPhone(normalized)
+                        ?: db.contactDao().getAllContactsSync().firstOrNull {
+                            gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils.areNumbersEqual(it.phone, phone)
+                        }
+                    if (existing == null) {
+                        val nextId = db.settingDao().getSetting("next_customer_id")?.value?.toIntOrNull() ?: 1
+                        val clientName = "عميل $nextId"
+                        val newContact = Contact(
+                            name = clientName,
+                            phone = normalized,
+                            originalPhone = phone,
+                            source = "واتساب",
+                            isSyncedToPhone = true
                         )
-                    )
-                    count++
-                    subscriptionRepo.syncSingleClientToDatabase(getApplication(), newContact, isDeleted = false)
-                    val canContinue = subscriptionRepo.recordContactSaved(getApplication())
-                    if (!canContinue) break
+                        val rowId = db.contactDao().insertContactIfAbsent(newContact)
+                        if (rowId <= 0L) continue
+                        db.settingDao().insertSetting(SettingEntity("next_customer_id", (nextId + 1).toString()))
+
+                        val alreadyLogged = db.logEntryDao().getAllLogsSync().any { entry ->
+                            entry.status == "تم الاستيراد" &&
+                                gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils.areNumbersEqual(entry.phone, phone)
+                        }
+                        if (!alreadyLogged) {
+                            db.logEntryDao().insertLog(
+                                LogEntry(
+                                    phone = phone,
+                                    source = "استيراد من جمايل",
+                                    status = "تم الاستيراد",
+                                    details = "تم استيراد جهة الاتصال: $name وحفظه كعميل: $clientName"
+                                )
+                            )
+                        }
+                        count++
+                        subscriptionRepo.syncSingleClientToDatabase(getApplication(), newContact.copy(id = rowId.toInt()), isDeleted = false)
+                        val canContinue = subscriptionRepo.recordContactSaved(getApplication())
+                        if (!canContinue) break
+                    }
                 }
             }
             onResult(count)
@@ -282,16 +296,22 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     if (success) {
                         val updatedContact = contact.copy(isSyncedToPhone = true)
-                        db.contactDao().insertContact(updatedContact)
+                        db.contactDao().updateContact(updatedContact)
                         subscriptionRepo.syncSingleClientToDatabase(getApplication(), updatedContact, isDeleted = false)
-                        db.logEntryDao().insertLog(
-                            LogEntry(
-                                phone = contact.originalPhone,
-                                source = "تصدير إلى جمايل",
-                                status = "تصدير ناجح",
-                                details = "تم تصدير العميل ${contact.name} إلى حساب جوجل: $account"
+                        val alreadyLogged = db.logEntryDao().getAllLogsSync().any { entry ->
+                            entry.status == "تصدير ناجح" &&
+                                gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils.areNumbersEqual(entry.phone, contact.originalPhone)
+                        }
+                        if (!alreadyLogged) {
+                            db.logEntryDao().insertLog(
+                                LogEntry(
+                                    phone = contact.originalPhone,
+                                    source = "تصدير إلى جمايل",
+                                    status = "تصدير ناجح",
+                                    details = "تم تصدير العميل ${contact.name} إلى حساب جوجل: $account"
+                                )
                             )
-                        )
+                        }
                         count++
                     }
                 }

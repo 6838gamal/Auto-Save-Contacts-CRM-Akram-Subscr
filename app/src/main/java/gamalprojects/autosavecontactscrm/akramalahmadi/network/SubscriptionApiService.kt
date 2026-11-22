@@ -1,7 +1,12 @@
 package gamalprojects.autosavecontactscrm.akramalahmadi.network
 
 import com.squareup.moshi.Json
+import com.squareup.moshi.JsonAdapter
 import com.squareup.moshi.JsonClass
+import com.squareup.moshi.JsonReader
+import com.squareup.moshi.JsonWriter
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.Types
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import retrofit2.Response
@@ -10,9 +15,87 @@ import retrofit2.converter.moshi.MoshiConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.Header
 import retrofit2.http.POST
+import java.lang.reflect.Type
 import java.net.URI
 import java.net.URLDecoder
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+
+class FlexibleLongAdapterFactory : JsonAdapter.Factory {
+    override fun create(type: Type, annotations: MutableSet<out Annotation>, moshi: Moshi): JsonAdapter<*>? {
+        if (annotations.isNotEmpty()) return null
+        val raw = Types.getRawType(type)
+        if (raw == Long::class.javaPrimitiveType) {
+            return object : JsonAdapter<Long>() {
+                override fun fromJson(reader: JsonReader): Long = readFlexibleLong(reader) ?: 0L
+                override fun toJson(writer: JsonWriter, value: Long?) {
+                    writer.value(value ?: 0L)
+                }
+            }
+        }
+        if (raw == Long::class.javaObjectType) {
+            return object : JsonAdapter<Long?>() {
+                override fun fromJson(reader: JsonReader): Long? = readFlexibleLong(reader)
+                override fun toJson(writer: JsonWriter, value: Long?) {
+                    if (value == null) writer.nullValue() else writer.value(value)
+                }
+            }
+        }
+        return null
+    }
+
+    private fun readFlexibleLong(reader: JsonReader): Long? {
+        return when (reader.peek()) {
+            JsonReader.Token.NULL -> reader.nextNull<Long?>()
+            JsonReader.Token.NUMBER -> {
+                val raw = reader.nextString().trim()
+                raw.toLongOrNull() ?: raw.toDoubleOrNull()?.toLong()
+            }
+            JsonReader.Token.STRING -> parseTimestampString(reader.nextString())
+            else -> {
+                reader.skipValue()
+                null
+            }
+        }
+    }
+
+    private fun parseTimestampString(rawValue: String?): Long? {
+        val raw = rawValue?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        raw.toLongOrNull()?.let { return it }
+        raw.toDoubleOrNull()?.let { return it.toLong() }
+
+        val normalizedFractional = raw.replace(Regex("\\.(\\d{3})\\d+"), ".$1")
+        val utcTz = TimeZone.getTimeZone("UTC")
+        val utcPatterns = listOf(
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "yyyy-MM-dd'T'HH:mm:ssXXX",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "yyyy-MM-dd HH:mm:ss.SSS",
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd"
+        )
+        for (pattern in utcPatterns) {
+            for (candidate in listOf(raw, normalizedFractional)) {
+                try {
+                    val sdf = SimpleDateFormat(pattern, Locale.US).apply {
+                        timeZone = utcTz
+                        isLenient = false
+                    }
+                    val parsed = sdf.parse(candidate)
+                    if (parsed != null) return parsed.time
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return null
+    }
+}
 
 data class ServerEndpointConfig(
     val baseUrl: String,
@@ -249,15 +332,23 @@ data class ClientSyncBatchRequest(
 @JsonClass(generateAdapter = true)
 data class SubscriptionApiResponse(
     @Json(name = "valid") val valid: Boolean = false,
-    @Json(name = "is_subscribed") val isSubscribed: Boolean = true,
-    @Json(name = "is_active") val isActive: Boolean = true,
+    @Json(name = "is_subscribed") val isSubscribed: Boolean = false,
+    @Json(name = "is_active") val isActive: Boolean = false,
     @Json(name = "is_trial") val isTrial: Boolean = false,
     @Json(name = "status") val status: String = "",
     @Json(name = "message") val message: String = "",
     @Json(name = "code") val code: String = "",
     @Json(name = "plan_label") val planLabel: String = "",
     @Json(name = "plan_type") val planType: String? = null,
+    @Json(name = "code_type") val codeType: String? = null,
+    @Json(name = "subscription_type") val subscriptionType: String? = null,
+    @Json(name = "plan") val plan: String? = null,
+    @Json(name = "duration_months") val durationMonths: Int = 0,
+    @Json(name = "months") val months: Int = 0,
+    @Json(name = "duration_days") val durationDays: Int = 0,
     @Json(name = "duration_minutes") val durationMinutes: Long = 0L,
+    @Json(name = "remaining_seconds") val remainingSeconds: Long? = null,
+    @Json(name = "expires_in_seconds") val expiresInSeconds: Long? = null,
     @Json(name = "is_lifetime") val isLifetime: Boolean = false,
     @Json(name = "max_contacts") val maxContacts: Int? = null,
     @Json(name = "used_contacts") val usedContacts: Int = 0,
@@ -379,10 +470,14 @@ interface SubscriptionApiService {
                     .addInterceptor(authInterceptor)
                     .build()
 
+                val moshi = Moshi.Builder()
+                    .add(FlexibleLongAdapterFactory())
+                    .build()
+
                 val service = Retrofit.Builder()
                     .baseUrl(endpoint.baseUrl)
                     .client(client)
-                    .addConverterFactory(MoshiConverterFactory.create())
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
                     .build()
                     .create(SubscriptionApiService::class.java)
 

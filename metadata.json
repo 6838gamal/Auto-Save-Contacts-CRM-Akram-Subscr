@@ -1,5 +1,5 @@
 {
-  "name": "AutoSave Contacts CRM",
+  "name": "حفظ الأرقام تلقائيا | الأحمدي",
   "description": "تطبيق Android احترافي لرصد وحفظ العملاء تلقائيًا في الخلفية من المكالمات والرسائل والواتساب",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

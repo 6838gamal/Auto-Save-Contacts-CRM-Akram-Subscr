@@ -127,20 +127,23 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
             }
         }
 
-        // Background reconnect loop: keeps retrying until Server API connection is verified
+        // Background reconnect & periodic subscription verification loop
         viewModelScope.launch {
+            var cycle = 0
             while (isActive) {
                 delay(10_000L)
-                if (repo.isDatabaseConfigured() && _dbConnectionStatus.value !is DbConnectionStatus.Connected) {
+                cycle++
+                val isDisconnected = _dbConnectionStatus.value !is DbConnectionStatus.Connected
+                if (repo.isDatabaseConfigured() && (isDisconnected || cycle % 6 == 0)) {
                     performConnectionAndClientSync(showCheckingState = false)
                 }
             }
         }
 
-        // Live countdown & automatic expiration guard
+        // Live 1-second countdown & strict expiration guard
         viewModelScope.launch {
             while (isActive) {
-                delay(15_000L)
+                delay(1_000L)
                 val now = System.currentTimeMillis()
                 _nowMillis.value = now
                 val current = _activeSubscription.value
@@ -149,7 +152,7 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                     _isExplicitlyLocked.value = true
                     _isConnectionError.value = false
                     _gateError.value =
-                        "انتهت مدة اشتراكك الحالية. يرجى إدخال كود جديد أو التواصل مع الإدارة على الرقم ${SubscriptionRepository.ADMIN_PHONE_DISPLAY}"
+                        "انتهت مدة اشتراكك الحالية. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم ${SubscriptionRepository.ADMIN_PHONE_DISPLAY}"
                     repo.lockSession(explicitLock = true)
                 }
             }
@@ -281,6 +284,12 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun submitSubscriptionCode(code: String, onUnlocked: () -> Unit) {
+        val currentActive = _activeSubscription.value
+        val now = System.currentTimeMillis()
+        if (currentActive != null && !currentActive.isExpired(now) && !currentActive.isQuotaReached()) {
+            _gateError.value = "أنت بالفعل مشترك واشتراكك الحالي لا يزال ساري المفعول."
+            return
+        }
         viewModelScope.launch {
             _isVerifying.value = true
             _gateError.value = null
@@ -344,15 +353,4 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    fun lockAndSwitchCode(onLocked: () -> Unit) {
-        viewModelScope.launch {
-            repo.lockSession(explicitLock = true)
-            _activeSubscription.value = null
-            _isExplicitlyLocked.value = true
-            _gateError.value = null
-            _reviewNotice.value = null
-            _isConnectionError.value = false
-            onLocked()
-        }
-    }
 }

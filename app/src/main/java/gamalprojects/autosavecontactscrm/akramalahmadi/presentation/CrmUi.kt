@@ -239,8 +239,12 @@ fun AppNavigationDrawer(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    // Observe statistics
+    // Observe statistics & subscription state
     val totalContacts by viewModel.contactsCount.collectAsStateWithLifecycle()
+    val activeSubscription by subscriptionViewModel.activeSubscription.collectAsStateWithLifecycle()
+    val freeAccessState by subscriptionViewModel.freeAccessState.collectAsStateWithLifecycle()
+    val nowMillis by subscriptionViewModel.nowMillis.collectAsStateWithLifecycle()
+    val isCurrentlySubscribed = activeSubscription != null && !activeSubscription!!.isExpired(nowMillis)
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -356,8 +360,12 @@ fun AppNavigationDrawer(
                 )
 
                 DrawerMenuItem(
-                    label = "مباشرة التفعيل والاشتراك",
-                    icon = Icons.Filled.VerifiedUser,
+                    label = if (isCurrentlySubscribed) {
+                        "حالة الاشتراك (مشترك بالفعل)"
+                    } else {
+                        "تفعيل الاشتراك (${freeAccessState.remainingContacts} مجاني)"
+                    },
+                    icon = if (isCurrentlySubscribed) Icons.Filled.Verified else Icons.Filled.VerifiedUser,
                     isSelected = false,
                     onClick = {
                         scope.launch { drawerState.close() }
@@ -423,8 +431,8 @@ fun AppNavigationDrawer(
                             modifier = Modifier.testTag("topbar_activate_subscription_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.VpnKey,
-                                contentDescription = "مباشرة التفعيل والاشتراك",
+                                imageVector = if (isCurrentlySubscribed) Icons.Filled.Verified else Icons.Filled.VpnKey,
+                                contentDescription = if (isCurrentlySubscribed) "أنت بالفعل مشترك" else "مباشرة التفعيل والاشتراك",
                                 tint = MaterialTheme.colorScheme.primary
                             )
                         }
@@ -520,16 +528,10 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         item {
-            if (activeSubscription != null) {
+            if (activeSubscription != null && !activeSubscription!!.isExpired(nowMillis)) {
                 SubscriptionStatusCard(
                     info = activeSubscription,
-                    nowMillis = nowMillis,
-                    onSwitchCode = {
-                        subscriptionViewModel.lockAndSwitchCode {
-                            viewModel.stopMonitoring()
-                            viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
-                        }
-                    }
+                    nowMillis = nowMillis
                 )
             } else {
                 FreeUsageStatusCard(
@@ -1403,16 +1405,10 @@ fun SettingsScreen(
     ) {
         // Subscription / Free Tier Status Card
         item {
-            if (activeSubscription != null) {
+            if (activeSubscription != null && !activeSubscription!!.isExpired(nowMillis)) {
                 SubscriptionStatusCard(
                     info = activeSubscription,
-                    nowMillis = nowMillis,
-                    onSwitchCode = {
-                        subscriptionViewModel.lockAndSwitchCode {
-                            viewModel.stopMonitoring()
-                            viewModel.navigateTo(Screen.SUBSCRIPTION_GATE)
-                        }
-                    }
+                    nowMillis = nowMillis
                 )
             } else {
                 FreeUsageStatusCard(

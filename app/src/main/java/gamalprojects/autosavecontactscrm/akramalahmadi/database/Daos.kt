@@ -26,6 +26,9 @@ interface ContactDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertContact(contact: Contact): Long
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertContactIfAbsent(contact: Contact): Long
+
     @Update
     suspend fun updateContact(contact: Contact)
 
@@ -41,6 +44,9 @@ interface LogEntryDao {
     @Query("SELECT * FROM logs_table ORDER BY timestamp DESC")
     fun getAllLogs(): Flow<List<LogEntry>>
 
+    @Query("SELECT * FROM logs_table ORDER BY timestamp DESC")
+    suspend fun getAllLogsSync(): List<LogEntry>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLog(log: LogEntry)
 
@@ -52,6 +58,9 @@ interface LogEntryDao {
 interface PhoneEventDao {
     @Query("SELECT * FROM events_table ORDER BY timestamp DESC")
     fun getAllEvents(): Flow<List<PhoneEvent>>
+
+    @Query("SELECT * FROM events_table ORDER BY timestamp DESC")
+    suspend fun getAllEventsSync(): List<PhoneEvent>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertEvent(event: PhoneEvent)

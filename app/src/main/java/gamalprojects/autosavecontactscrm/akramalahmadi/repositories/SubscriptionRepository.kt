@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Calendar
 
 sealed class DbConnectionStatus {
     data object Checking : DbConnectionStatus()
@@ -56,9 +57,20 @@ sealed class ReviewRequestResult {
     data class Failure(val reason: String, val isConnectionError: Boolean = false) : ReviewRequestResult()
 }
 
+enum class SubscriptionPlanTier(
+    val displayTitle: String,
+    val expectedMonths: Int,
+    val fallbackDays: Long
+) {
+    FIVE_MONTHS("باقة 5 أشهر", 5, 150L),
+    TWELVE_MONTHS("باقة 12 شهراً", 12, 365L),
+    TIMED("اشتراك محدد المدة", 0, 0L)
+}
+
 data class ActiveSubscriptionInfo(
     val code: String,
     val label: String,
+    val planTier: SubscriptionPlanTier,
     val isLifetime: Boolean,
     val isSubscribed: Boolean,
     val isActive: Boolean,
@@ -72,7 +84,7 @@ data class ActiveSubscriptionInfo(
     val deviceModel: String
 ) {
     fun isExpired(now: Long = System.currentTimeMillis()): Boolean {
-        val exp = expiresAt ?: return false
+        val exp = expiresAt ?: return true
         return now >= exp
     }
 
@@ -86,6 +98,13 @@ data class ActiveSubscriptionInfo(
         val max = maxContacts ?: return null
         if (max <= 0) return null
         return (max - usedContacts).coerceAtLeast(0)
+    }
+
+    fun remainingProgress(now: Long = System.currentTimeMillis()): Float {
+        val exp = expiresAt ?: return 0f
+        val total = (exp - activatedAt).coerceAtLeast(1L)
+        val remaining = (exp - now).coerceAtLeast(0L)
+        return (remaining.toFloat() / total.toFloat()).coerceIn(0f, 1f)
     }
 }
 
@@ -124,6 +143,7 @@ class SubscriptionRepository(
         private const val KEY_SUBSCRIPTION_LOCKED = "subscription_explicitly_locked"
         private const val KEY_FREE_USED = "free_contacts_used"
         private const val KEY_FREE_EXHAUSTED = "free_tier_exhausted"
+        private const val KEY_FREE_WARNING_TIER = "free_tier_warning_milestone"
         private const val KEY_PENDING_DELETED_CLIENTS = "pending_deleted_clients_json"
         private const val KEY_PENDING_TELEMETRY_SYNC = "pending_telemetry_sync"
 
@@ -163,7 +183,10 @@ class SubscriptionRepository(
                 flowOf(null)
             } else {
                 codeDao.observeCode(activeCode).map { entity ->
+                    val now = System.currentTimeMillis()
                     if (entity == null || !entity.isSubscribed || !entity.isActive) {
+                        null
+                    } else if (entity.expiresAt == null || now >= entity.expiresAt) {
                         null
                     } else if (entity.maxContacts != null && entity.maxContacts > 0 && entity.usedContacts >= entity.maxContacts) {
                         null
@@ -242,8 +265,8 @@ class SubscriptionRepository(
 
         val cached = activeCodeKey?.takeIf { it.isNotBlank() }?.let { codeDao.getCode(it) }
         if (cached != null) {
-            if (!cached.isLifetime && cached.expiresAt != null && now >= cached.expiresAt) {
-                val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
+            if (cached.expiresAt == null || now >= cached.expiresAt) {
+                val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
                 settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
                 settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
                 settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
@@ -301,47 +324,29 @@ class SubscriptionRepository(
 
         val cached = activeCodeKey?.takeIf { it.isNotBlank() }?.let { codeDao.getCode(it) }
         val now = System.currentTimeMillis()
+        var effectiveActiveCodeKey = activeCodeKey
+        var effectiveCached = cached
+        var effectiveExplicitlyLocked = explicitlyLocked
 
-        // Local expiration guard
-        if (cached != null && !cached.isLifetime && cached.expiresAt != null && now >= cached.expiresAt) {
-            val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
+        // Local expiration guard (still queries server afterwards in case admin renewed a subscription for this device)
+        if (cached != null && (cached.expiresAt == null || now >= cached.expiresAt)) {
+            val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
             settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
             settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
             settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
             upsertUserProfile(snapshot, activeCode = null)
-            val syncStatus = pingAndSyncUserOnly(snapshot, totalContacts, freeState, null)
-            if (syncStatus is DbConnectionStatus.Connected) {
-                syncAllClientsToDatabase(context)
-            }
-            return@withContext SessionVerifyOutcome(
-                activeInfo = null,
-                freeAccessState = freeState,
-                isAllowed = false,
-                dbStatus = syncStatus,
-                errorMessage = msg,
-                isConnectionError = false
-            )
-        }
-
-        // Local quota guard
-        if (cached != null && cached.maxContacts != null && cached.maxContacts > 0 && cached.usedContacts >= cached.maxContacts) {
+            effectiveActiveCodeKey = null
+            effectiveCached = null
+            effectiveExplicitlyLocked = true
+        } else if (cached != null && cached.maxContacts != null && cached.maxContacts > 0 && cached.usedContacts >= cached.maxContacts) {
             val msg = "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
             settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
             settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
             settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
             upsertUserProfile(snapshot, activeCode = null)
-            val syncStatus = pingAndSyncUserOnly(snapshot, totalContacts, freeState, null)
-            if (syncStatus is DbConnectionStatus.Connected) {
-                syncAllClientsToDatabase(context)
-            }
-            return@withContext SessionVerifyOutcome(
-                activeInfo = null,
-                freeAccessState = freeState,
-                isAllowed = false,
-                dbStatus = syncStatus,
-                errorMessage = msg,
-                isConnectionError = false
-            )
+            effectiveActiveCodeKey = null
+            effectiveCached = null
+            effectiveExplicitlyLocked = true
         }
 
         val api = resolveApiService()
@@ -351,9 +356,9 @@ class SubscriptionRepository(
                 snapshot = snapshot,
                 freeState = freeState,
                 totalContacts = totalContacts,
-                activeCodeKey = activeCodeKey,
-                cachedCode = cached,
-                explicitlyLocked = explicitlyLocked
+                activeCodeKey = effectiveActiveCodeKey,
+                cachedCode = effectiveCached,
+                explicitlyLocked = effectiveExplicitlyLocked
             )
             if (outcome.dbStatus is DbConnectionStatus.Connected) {
                 syncAllClientsToDatabase(context)
@@ -363,12 +368,13 @@ class SubscriptionRepository(
 
         // Server not configured yet: allow free usage up to 100 or valid cached code, prompt to contact owner
         val notConfiguredStatus = DbConnectionStatus.NotConfigured(MSG_DB_NOT_CONFIGURED)
-        if (!activeCodeKey.isNullOrBlank()) {
-            if (cached != null && cached.isActive && cached.isSubscribed &&
-                (cached.boundUserId.isNullOrBlank() || cached.boundUserId == snapshot.userId)
+        if (!effectiveActiveCodeKey.isNullOrBlank()) {
+            if (effectiveCached != null && effectiveCached.isActive && effectiveCached.isSubscribed &&
+                effectiveCached.expiresAt != null && now < effectiveCached.expiresAt &&
+                (effectiveCached.boundUserId.isNullOrBlank() || effectiveCached.boundUserId == snapshot.userId)
             ) {
                 return@withContext SessionVerifyOutcome(
-                    activeInfo = cached.toActiveInfo(snapshot),
+                    activeInfo = effectiveCached.toActiveInfo(snapshot),
                     freeAccessState = freeState,
                     isAllowed = true,
                     dbStatus = notConfiguredStatus,
@@ -379,14 +385,14 @@ class SubscriptionRepository(
             return@withContext SessionVerifyOutcome(
                 activeInfo = null,
                 freeAccessState = freeState,
-                isAllowed = !freeState.isExhausted && !explicitlyLocked,
+                isAllowed = !freeState.isExhausted && !effectiveExplicitlyLocked,
                 dbStatus = notConfiguredStatus,
-                errorMessage = if (!freeState.isExhausted && !explicitlyLocked) null else MSG_DB_NOT_CONFIGURED,
+                errorMessage = if (!freeState.isExhausted && !effectiveExplicitlyLocked) null else MSG_DB_NOT_CONFIGURED,
                 isConnectionError = true
             )
         }
 
-        if (!freeState.isExhausted && !explicitlyLocked) {
+        if (!freeState.isExhausted && !effectiveExplicitlyLocked) {
             return@withContext SessionVerifyOutcome(
                 activeInfo = null,
                 freeAccessState = freeState,
@@ -490,10 +496,10 @@ class SubscriptionRepository(
 
                 val dbStatus = DbConnectionStatus.Connected("متصل")
                 if (connectBody != null && connectBody.valid && connectBody.isSubscribed && connectBody.isActive && connectBody.code.isNotBlank()) {
-                    val failure = validateApiStatusFlags(connectBody, 0)
+                    val failure = validateApiStatusFlags(connectBody, 0, existingExpiresAt = cachedCode?.expiresAt)
                     if (failure == null) {
                         settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
-                        val info = persistActiveSubscription(connectBody.code, connectBody, snapshot, existingUsed = connectBody.usedContacts)
+                        val info = persistActiveSubscription(connectBody.code, connectBody, snapshot, existingUsed = connectBody.usedContacts, existingExpiresAt = cachedCode?.expiresAt)
                         return SessionVerifyOutcome(info, effectiveFreeState, true, dbStatus, null, false)
                     }
                 }
@@ -523,11 +529,11 @@ class SubscriptionRepository(
 
             if (response.isSuccessful) {
                 val body = response.body()
-                val failureReason = validateApiStatusFlags(body, cachedUsedQuota)
+                val failureReason = validateApiStatusFlags(body, cachedUsedQuota, existingExpiresAt = cachedCode?.expiresAt)
                 val connectedStatus = DbConnectionStatus.Connected("متصل")
                 if (body != null && failureReason == null) {
                     settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "0"))
-                    val info = persistActiveSubscription(activeCodeKey, body, snapshot, existingUsed = cachedUsedQuota)
+                    val info = persistActiveSubscription(activeCodeKey, body, snapshot, existingUsed = cachedUsedQuota, existingExpiresAt = cachedCode?.expiresAt)
                     SessionVerifyOutcome(info, effectiveFreeState, true, connectedStatus, null, false)
                 } else {
                     val err = failureReason ?: MSG_CONTACT_OWNER_OFFLINE
@@ -568,7 +574,7 @@ class SubscriptionRepository(
         val validCached = if (!activeCodeKey.isNullOrBlank() && cachedCode != null &&
             cachedCode.isActive && cachedCode.isSubscribed &&
             (cachedCode.boundUserId.isNullOrBlank() || cachedCode.boundUserId == snapshot.userId) &&
-            (cachedCode.isLifetime || cachedCode.expiresAt == null || now < cachedCode.expiresAt) &&
+            cachedCode.expiresAt != null && now < cachedCode.expiresAt &&
             (cachedCode.maxContacts == null || cachedCode.maxContacts <= 0 || cachedCode.usedContacts < cachedCode.maxContacts)
         ) {
             cachedCode
@@ -781,7 +787,13 @@ class SubscriptionRepository(
         val entity = codeDao.getCode(activeCodeKey) ?: return@withContext false
         if (!entity.isSubscribed || !entity.isActive) return@withContext false
         val now = System.currentTimeMillis()
-        if (!entity.isLifetime && entity.expiresAt != null && now >= entity.expiresAt) return@withContext false
+        if (entity.expiresAt == null || now >= entity.expiresAt) {
+            val msg = "انتهت مدة اشتراكك الحالية. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
+            settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
+            settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+            settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
+            return@withContext false
+        }
         val max = entity.maxContacts
         if (max != null && max > 0 && entity.usedContacts >= max) return@withContext false
         true
@@ -815,6 +827,25 @@ class SubscriptionRepository(
                     MSG_FREE_LIMIT_REACHED
                 )
                 return@withContext false
+            } else {
+                val milestone = when {
+                    nextFreeUsed >= 95 -> 95
+                    nextFreeUsed >= 90 -> 90
+                    nextFreeUsed >= 80 -> 80
+                    else -> 0
+                }
+                if (milestone > 0) {
+                    val lastWarned = settingDao.getSetting(KEY_FREE_WARNING_TIER)?.value?.toIntOrNull() ?: 0
+                    if (milestone > lastWarned) {
+                        settingDao.insertSetting(SettingEntity(KEY_FREE_WARNING_TIER, milestone.toString()))
+                        val remaining = (FREE_CONTACTS_LIMIT - nextFreeUsed).coerceAtLeast(0)
+                        NotificationHelper.showNotification(
+                            context,
+                            "تنبيه الرصيد المجاني (متبقي $remaining جهة اتصال)",
+                            "أوشك الحد المجاني المحدود ($FREE_CONTACTS_LIMIT جهة اتصال) على النفاد. يرجى تفعيل كود اشتراك (5 أشهر أو 12 شهراً)."
+                        )
+                    }
+                }
             }
             return@withContext true
         }
@@ -934,7 +965,92 @@ class SubscriptionRepository(
         }
     }
 
-    private fun validateApiStatusFlags(body: SubscriptionApiResponse?, localUsed: Int): String? {
+    private fun normalizeEpochMillis(raw: Long?): Long? {
+        if (raw == null || raw <= 0L) return null
+        return if (raw < 10_000_000_000L) raw * 1000L else raw
+    }
+
+    private fun resolvePlanTier(
+        planType: String?,
+        planLabel: String?,
+        durationMonths: Int,
+        durationDays: Int,
+        durationMinutes: Long
+    ): SubscriptionPlanTier {
+        val normalizedText = gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils
+            .cleanNumber("${planType.orEmpty()} ${planLabel.orEmpty()}")
+        val rawCombined = "${planType.orEmpty()} ${planLabel.orEmpty()}".uppercase()
+            .replace('-', '_')
+            .replace(' ', '_')
+        return when {
+            durationMonths == 12 -> SubscriptionPlanTier.TWELVE_MONTHS
+            durationMonths == 5 -> SubscriptionPlanTier.FIVE_MONTHS
+            rawCombined.contains("12_MONTH") || rawCombined.contains("12MONTH") ||
+                rawCombined.contains("TWELVE") || rawCombined.contains("12M") ||
+                rawCombined.contains("12_شهر") || rawCombined.contains("12شهر") ||
+                normalizedText == "12" ||
+                rawCombined.contains("ANNUAL") || rawCombined.contains("YEAR") ||
+                rawCombined.contains("سنة") || rawCombined.contains("سنوي") -> SubscriptionPlanTier.TWELVE_MONTHS
+            rawCombined.contains("5_MONTH") || rawCombined.contains("5MONTH") ||
+                rawCombined.contains("FIVE") || rawCombined.contains("5M") ||
+                rawCombined.contains("5_أشهر") || rawCombined.contains("5أشهر") ||
+                rawCombined.contains("5_شهور") || rawCombined.contains("5شهور") ||
+                normalizedText == "5" -> SubscriptionPlanTier.FIVE_MONTHS
+            durationDays in 350..380 -> SubscriptionPlanTier.TWELVE_MONTHS
+            durationDays in 140..165 -> SubscriptionPlanTier.FIVE_MONTHS
+            durationMinutes in 500_000L..550_000L -> SubscriptionPlanTier.TWELVE_MONTHS
+            durationMinutes in 200_000L..240_000L -> SubscriptionPlanTier.FIVE_MONTHS
+            else -> SubscriptionPlanTier.TIMED
+        }
+    }
+
+    private fun extractMonthsFromBody(body: SubscriptionApiResponse): Int {
+        return maxOf(body.durationMonths, body.months)
+    }
+
+    private fun extractPlanDescriptor(body: SubscriptionApiResponse): String {
+        return listOfNotNull(body.planType, body.codeType, body.subscriptionType, body.plan)
+            .joinToString(" ")
+    }
+
+    private fun addCalendarMonths(startMillis: Long, months: Int): Long {
+        val cal = Calendar.getInstance()
+        cal.timeInMillis = startMillis
+        cal.add(Calendar.MONTH, months)
+        return cal.timeInMillis
+    }
+
+    private fun resolveExpiresAt(
+        body: SubscriptionApiResponse,
+        activatedAt: Long,
+        tier: SubscriptionPlanTier,
+        existingExpiresAt: Long? = null
+    ): Long? {
+        val now = System.currentTimeMillis()
+        normalizeEpochMillis(body.expiresAt)?.let { return it }
+        body.remainingSeconds?.takeIf { it > 0L }?.let { return now + it * 1000L }
+        body.expiresInSeconds?.takeIf { it > 0L }?.let { return now + it * 1000L }
+        if (body.durationMinutes > 0L) {
+            return activatedAt + body.durationMinutes * 60_000L
+        }
+        if (body.durationDays > 0) {
+            return activatedAt + body.durationDays * 86_400_000L
+        }
+        val monthsCount = extractMonthsFromBody(body)
+        if (monthsCount > 0) {
+            return addCalendarMonths(activatedAt, monthsCount)
+        }
+        if (tier.expectedMonths > 0) {
+            return addCalendarMonths(activatedAt, tier.expectedMonths)
+        }
+        return normalizeEpochMillis(existingExpiresAt)
+    }
+
+    private fun validateApiStatusFlags(
+        body: SubscriptionApiResponse?,
+        localUsed: Int,
+        existingExpiresAt: Long? = null
+    ): String? {
         if (body == null) return MSG_CONTACT_OWNER_OFFLINE
         if (!body.isSubscribed) {
             return body.message.ifBlank { "لم يتم الاشتراك بعد أو الكود قيد المراجعة. يرجى التواصل مع الإدارة على $ADMIN_PHONE_DISPLAY" }
@@ -944,6 +1060,24 @@ class SubscriptionRepository(
         }
         if (!body.valid) {
             return body.message.ifBlank { "كود الاشتراك غير صحيح أو منتهي الصلاحية." }
+        }
+        val now = System.currentTimeMillis()
+        val activatedAt = normalizeEpochMillis(body.activatedAt) ?: now
+        val tier = resolvePlanTier(
+            planType = extractPlanDescriptor(body),
+            planLabel = body.planLabel,
+            durationMonths = extractMonthsFromBody(body),
+            durationDays = body.durationDays,
+            durationMinutes = body.durationMinutes
+        )
+        val resolvedExpiresAt = resolveExpiresAt(body, activatedAt, tier, existingExpiresAt)
+            ?: return body.message.ifBlank {
+                "تعذر تحديد مدة صلاحية الكود من الخادم (باقات 5 أشهر أو 12 شهراً). يرجى التواصل مع الإدارة على $ADMIN_PHONE_DISPLAY"
+            }
+        if (now >= resolvedExpiresAt) {
+            return body.message.ifBlank {
+                "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد أو التواصل مع الإدارة على $ADMIN_PHONE_DISPLAY"
+            }
         }
         val effectiveUsed = maxOf(localUsed, body.usedContacts)
         val max = body.maxContacts
@@ -1135,32 +1269,57 @@ class SubscriptionRepository(
         fallbackCode: String,
         body: SubscriptionApiResponse,
         snapshot: UserNetworkSnapshot,
-        existingUsed: Int
+        existingUsed: Int,
+        existingExpiresAt: Long? = null
     ): ActiveSubscriptionInfo {
         val now = System.currentTimeMillis()
         val resolvedCode = body.code.ifBlank { fallbackCode }.uppercase()
-        val activatedAt = body.activatedAt ?: now
-        val expiresAt = if (body.isLifetime) {
-            null
+        val existingEntity = codeDao.getCode(resolvedCode)
+        val activatedAt = normalizeEpochMillis(body.activatedAt) ?: existingEntity?.activatedAt ?: now
+        val tier = resolvePlanTier(
+            planType = extractPlanDescriptor(body),
+            planLabel = body.planLabel.ifBlank { existingEntity?.label.orEmpty() },
+            durationMonths = extractMonthsFromBody(body),
+            durationDays = body.durationDays,
+            durationMinutes = body.durationMinutes.takeIf { it > 0L } ?: (existingEntity?.durationMinutes ?: 0L)
+        )
+        val resolvedTier = if (tier == SubscriptionPlanTier.TIMED && existingEntity != null) {
+            resolvePlanTier(
+                planType = existingEntity.label,
+                planLabel = existingEntity.label,
+                durationMonths = 0,
+                durationDays = 0,
+                durationMinutes = existingEntity.durationMinutes
+            )
         } else {
-            body.expiresAt ?: if (body.durationMinutes > 0L) {
-                activatedAt + body.durationMinutes * 60_000L
-            } else {
-                null
-            }
+            tier
         }
-        val label = body.planLabel.ifBlank { "اشتراك مفعل" }
+        val expiresAt = resolveExpiresAt(
+            body = body,
+            activatedAt = activatedAt,
+            tier = resolvedTier,
+            existingExpiresAt = existingExpiresAt ?: existingEntity?.expiresAt
+        )
+        val resolvedMinutes = when {
+            body.durationMinutes > 0L -> body.durationMinutes
+            expiresAt != null && expiresAt > activatedAt -> ((expiresAt - activatedAt) / 60_000L).coerceAtLeast(1L)
+            resolvedTier.fallbackDays > 0L -> resolvedTier.fallbackDays * 1440L
+            else -> existingEntity?.durationMinutes ?: 0L
+        }
+        val label = body.planLabel.ifBlank {
+            if (resolvedTier != SubscriptionPlanTier.TIMED) resolvedTier.displayTitle else existingEntity?.label.orEmpty().ifBlank { resolvedTier.displayTitle }
+        }
         val boundUser = body.boundUserId?.ifBlank { null } ?: snapshot.userId
         val boundIp = body.boundIp?.ifBlank { null } ?: snapshot.publicIp
-        val normalizedMax = body.maxContacts?.takeIf { it > 0 }
-        val effectiveUsed = maxOf(existingUsed, body.usedContacts)
+        val normalizedMax = body.maxContacts?.takeIf { it > 0 } ?: existingEntity?.maxContacts?.takeIf { it > 0 }
+        val effectiveUsed = maxOf(existingUsed, body.usedContacts, existingEntity?.usedContacts ?: 0)
 
         codeDao.upsertCode(
             SubscriptionCodeEntity(
                 code = resolvedCode,
                 label = label,
-                durationMinutes = body.durationMinutes,
-                isLifetime = body.isLifetime,
+                durationMinutes = resolvedMinutes,
+                isLifetime = false,
                 isSubscribed = body.isSubscribed,
                 isActive = body.isActive,
                 isTrial = body.isTrial,
@@ -1184,7 +1343,8 @@ class SubscriptionRepository(
         return ActiveSubscriptionInfo(
             code = resolvedCode,
             label = label,
-            isLifetime = body.isLifetime,
+            planTier = resolvedTier,
+            isLifetime = false,
             isSubscribed = body.isSubscribed,
             isActive = body.isActive,
             isTrial = body.isTrial,
@@ -1199,10 +1359,18 @@ class SubscriptionRepository(
     }
 
     private fun SubscriptionCodeEntity.toActiveInfo(snapshot: UserNetworkSnapshot? = null): ActiveSubscriptionInfo {
+        val tier = resolvePlanTier(
+            planType = label,
+            planLabel = label,
+            durationMonths = 0,
+            durationDays = 0,
+            durationMinutes = durationMinutes
+        )
         return ActiveSubscriptionInfo(
             code = code,
-            label = label.ifBlank { "اشتراك مفعل" },
-            isLifetime = isLifetime,
+            label = label.ifBlank { tier.displayTitle },
+            planTier = tier,
+            isLifetime = false,
             isSubscribed = isSubscribed,
             isActive = isActive,
             isTrial = isTrial,

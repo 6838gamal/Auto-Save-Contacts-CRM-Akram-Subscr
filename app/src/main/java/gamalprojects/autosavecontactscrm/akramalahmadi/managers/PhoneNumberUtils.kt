@@ -3,39 +3,50 @@ package gamalprojects.autosavecontactscrm.akramalahmadi.managers
 object PhoneNumberUtils {
 
     /**
-     * Cleans the phone number of any non-digit characters.
+     * Converts Arabic-Indic / Eastern Arabic numerals to ASCII digits,
+     * then strips any non-digit character.
      */
     fun cleanNumber(phone: String): String {
-        return phone.replace(Regex("[^0-9]"), "")
+        val sb = StringBuilder(phone.length)
+        for (ch in phone) {
+            when (ch) {
+                in '0'..'9' -> sb.append(ch)
+                in '\u0660'..'\u0669' -> sb.append(('0'.code + (ch.code - 0x0660)).toChar())
+                in '\u06F0'..'\u06F9' -> sb.append(('0'.code + (ch.code - 0x06F0)).toChar())
+            }
+        }
+        return sb.toString()
     }
 
     /**
      * Standardizes a phone number.
-     * Removes leading +, 00, or local 0 so we can compare the core number.
+     * Removes leading +, 00, country prefix (e.g. 967), or local 0 so we can compare the core number.
      * In Yemen, a mobile number like 777777777 can appear as:
-     * +967777777777, 967777777777, 0777777777, 777777777.
+     * +967777777777, 00967777777777, 967777777777, 0777777777, 777777777.
      */
     fun normalize(phone: String): String {
-        val cleaned = cleanNumber(phone)
-        if (cleaned.isEmpty()) return ""
+        var digits = cleanNumber(phone)
+        if (digits.isEmpty()) return ""
 
-        // Handing Yemen/General country codes
-        // If it starts with 967, take the last 9 digits.
-        if (cleaned.startsWith("967") && cleaned.length >= 12) {
-            return cleaned.substring(cleaned.length - 9)
-        }
-        
-        // If it starts with 0 and occupies 10 digits (e.g. 0777777777)
-        if (cleaned.startsWith("0") && cleaned.length == 10) {
-            return cleaned.substring(1)
+        while (digits.startsWith("00") && digits.length > 2) {
+            digits = digits.substring(2)
         }
 
-        // Default: if length is longer than 9, return latest 9 digits for matching
-        if (cleaned.length >= 9) {
-            return cleaned.substring(cleaned.length - 9)
+        // Handling Yemen country code (967) for both 9-digit mobile and 7-8 digit landline
+        if (digits.startsWith("967") && digits.length >= 10) {
+            digits = digits.substring(3)
         }
 
-        return cleaned
+        while (digits.startsWith("0") && digits.length >= 8) {
+            digits = digits.substring(1)
+        }
+
+        // Consistent matching on core last 9 digits for international numbers
+        if (digits.length >= 9) {
+            return digits.substring(digits.length - 9)
+        }
+
+        return digits
     }
 
     /**

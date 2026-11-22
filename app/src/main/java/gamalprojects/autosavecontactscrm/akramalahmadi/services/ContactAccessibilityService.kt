@@ -5,15 +5,18 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
+import gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ContactsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
 class ContactAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(Dispatchers.IO)
     private lateinit var repo: ContactsRepository
+    private val recentlyProcessed = ConcurrentHashMap<String, Long>()
 
     override fun onCreate() {
         super.onCreate()
@@ -28,33 +31,54 @@ class ContactAccessibilityService : AccessibilityService() {
         // Only monitor WhatsApp or Dialer layouts to preserve battery
         if (packageName == "com.whatsapp" || packageName.contains("dialer") || packageName.contains("phone")) {
             val rootNode = rootInActiveWindow ?: return
-            
-            // Perform light scan of UI nodes
+            val candidates = LinkedHashSet<String>()
+            collectCandidateNumbers(rootNode, candidates)
+            if (candidates.isEmpty()) return
+
+            val now = System.currentTimeMillis()
+            val toProcess = candidates.filter { candidate ->
+                val norm = PhoneNumberUtils.normalize(candidate)
+                if (norm.length < 7) return@filter false
+                val lastSeen = recentlyProcessed[norm]
+                if (lastSeen != null && (now - lastSeen) < 60_000L) {
+                    false
+                } else {
+                    recentlyProcessed[norm] = now
+                    true
+                }
+            }
+            if (recentlyProcessed.size > 500) {
+                recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
+            }
+            if (toProcess.isEmpty()) return
+
             scope.launch {
-                scanNode(rootNode)
+                for (potentialNumber in toProcess) {
+                    Log.d("ContactAccessibility", "Detected potential number in UI: $potentialNumber")
+                    repo.processNewConnection(
+                        applicationContext,
+                        potentialNumber,
+                        "خدمة إمكانية الوصول",
+                        "التقاط مباشر من الشاشة"
+                    )
+                }
             }
         }
     }
 
-    private suspend fun scanNode(node: AccessibilityNodeInfo?) {
+    private fun collectCandidateNumbers(node: AccessibilityNodeInfo?, out: MutableSet<String>) {
         if (node == null) return
 
         val text = node.text?.toString()?.trim()
         if (!text.isNullOrEmpty()) {
             val potentialNumber = extractRawNumberIfValid(text)
             if (potentialNumber != null) {
-                Log.d("ContactAccessibility", "Detected potential number in UI: $potentialNumber")
-                repo.processNewConnection(
-                    applicationContext,
-                    potentialNumber,
-                    "خدمة إمكانية الوصول",
-                    "التقاط مباشر من الشاشة"
-                )
+                out.add(potentialNumber)
             }
         }
 
         for (i in 0 until node.childCount) {
-            scanNode(node.getChild(i))
+            collectCandidateNumbers(node.getChild(i), out)
         }
     }
 

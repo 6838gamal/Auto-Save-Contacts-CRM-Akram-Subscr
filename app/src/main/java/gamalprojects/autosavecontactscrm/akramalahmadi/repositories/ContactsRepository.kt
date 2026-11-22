@@ -8,10 +8,17 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils
 import gamalprojects.autosavecontactscrm.akramalahmadi.notifications.NotificationHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 class ContactsRepository(private val db: AppDatabase) {
+
+    companion object {
+        // Process-wide lock prevents concurrent CallReceiver / SmsReceiver / NotificationListener / AccessibilityService
+        // triggers from double-saving or double-logging the same phone number.
+        val saveMutex = Mutex()
+    }
 
     private val contactDao = db.contactDao()
     private val logEntryDao = db.logEntryDao()
@@ -27,7 +34,7 @@ class ContactsRepository(private val db: AppDatabase) {
 
     /**
      * Engine's unified point of processing for any newly captured number.
-     * Implements "ContactExistenceChecker" and "Smart Save Engine".
+     * Strictly guarantees each phone number is saved and logged ONCE only.
      */
     suspend fun processNewConnection(
         context: Context,
@@ -36,114 +43,131 @@ class ContactsRepository(private val db: AppDatabase) {
         contentSnippet: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         val cleaned = PhoneNumberUtils.cleanNumber(rawNumber)
-        if (cleaned.isEmpty()) {
+        if (cleaned.length < 7) {
             return@withContext false
         }
 
-        // 1. Normalize the phone number
         val normalized = PhoneNumberUtils.normalize(rawNumber)
-
-        // 2. Check Device Native Contacts: Ignore completely if exists there, do not log, do not save.
-        if (ContactsManager.isNumberInNativeContacts(context, rawNumber)) {
-            Log.d("ContactsRepository", "Number $rawNumber already exists in native contacts. Ignoring entirely.")
+        if (normalized.length < 7) {
             return@withContext false
         }
 
-        // 3. Keep record of the event in events_table
-        phoneEventDao.insertEvent(
-            PhoneEvent(
-                phone = rawNumber,
-                type = source,
-                content = contentSnippet.ifEmpty { "تواصل متبادل عبر $source" }
-            )
-        )
+        saveMutex.withLock {
+            // 1. Check Device Native Contacts: Ignore completely if exists there, do not log, do not save.
+            if (ContactsManager.isNumberInNativeContacts(context, rawNumber)) {
+                Log.d("ContactsRepository", "Number $rawNumber already exists in native contacts. Ignoring entirely.")
+                return@withLock false
+            }
 
-        // 4. Check Internal database
-        val existingContact = contactDao.getContactByPhone(normalized)
-        if (existingContact != null) {
-            // Already saved in our CRM! Update last activity, interaction count, and save log
-            val updated = existingContact.copy(
-                lastActivity = System.currentTimeMillis(),
-                interactionCount = existingContact.interactionCount + 1
-            )
-            contactDao.updateContact(updated)
+            // 2. Check Internal CRM database (exact normalized match + defensive equivalence scan)
+            val existingContact = contactDao.getContactByPhone(normalized)
+                ?: contactDao.getAllContactsSync().firstOrNull {
+                    PhoneNumberUtils.areNumbersEqual(it.phone, rawNumber) ||
+                        PhoneNumberUtils.areNumbersEqual(it.originalPhone, rawNumber)
+                }
 
-            logEntryDao.insertLog(
-                LogEntry(
-                    phone = rawNumber,
-                    source = source,
-                    status = "تحديث النشاط",
-                    details = "تحديث آخر نشاط للعميل ${existingContact.name}. عدد التفاعلات: ${updated.interactionCount}"
-                )
-            )
-            subscriptionRepo.syncSingleClientToDatabase(context, updated, isDeleted = false)
-            return@withContext true
-        }
+            if (existingContact != null) {
+                // Already saved in CRM records! Never duplicate in contacts_table, native contacts, logs_table, or quota.
+                Log.d("ContactsRepository", "Number $normalized already exists in CRM (${existingContact.name}). Skipping duplicate save/log.")
+                return@withLock false
+            }
 
-        // 5. Check subscription & usage quota before saving any new contact
-        if (!subscriptionRepo.canSaveNewContact()) {
-            logEntryDao.insertLog(
-                LogEntry(
-                    phone = rawNumber,
-                    source = source,
-                    status = "تجاوز حد الاشتراك",
-                    details = "تم إيقاف الحفظ التلقائي للرقم $rawNumber بسبب انتهاء الاشتراك أو الوصول للحد الأقصى للباقة."
-                )
-            )
-            return@withContext false
-        }
+            // 3. Check subscription & usage quota before saving any new contact
+            if (!subscriptionRepo.canSaveNewContact()) {
+                val alreadyLoggedLimitForNumber = logEntryDao.getAllLogsSync().any { entry ->
+                    entry.status == "تجاوز حد الاشتراك" &&
+                        PhoneNumberUtils.areNumbersEqual(entry.phone, rawNumber)
+                }
+                if (!alreadyLoggedLimitForNumber) {
+                    logEntryDao.insertLog(
+                        LogEntry(
+                            phone = rawNumber,
+                            source = source,
+                            status = "تجاوز حد الاشتراك",
+                            details = "تم إيقاف الحفظ التلقائي للرقم $rawNumber بسبب انتهاء الاشتراك أو الوصول للحد الأقصى للباقة."
+                        )
+                    )
+                }
+                return@withLock false
+            }
 
-        // 6. If fully new, perform "Smart Save"
-        // Generate customer name with incremental count from settings
-        val nextId = getNextCustomerId()
-        val clientName = "عميل $nextId"
+            // 4. First-time save only: insert atomically using IGNORE conflict strategy
+            val nextId = getNextCustomerId()
+            val clientName = "عميل $nextId"
 
-        // Load sync configuration
-        val googleSyncEnabled = settingDao.getSetting("google_sync_enabled")?.value == "1"
-        val gmailAccount = settingDao.getSetting("gmail_account")?.value ?: ""
-
-        // Save to native contacts or Google account contacts
-        val isSynced = if (googleSyncEnabled && gmailAccount.isNotBlank()) {
-            ContactsManager.saveToGoogleContacts(context, clientName, rawNumber, gmailAccount)
-        } else {
-            ContactsManager.saveToNativeContacts(context, clientName, rawNumber)
-        }
-
-        // Save to internal CRM database
-        val newContact = Contact(
-            name = clientName,
-            phone = normalized,
-            originalPhone = rawNumber,
-            source = source,
-            isSyncedToPhone = isSynced
-        )
-        contactDao.insertContact(newContact)
-
-        // Increment customer counter for future use
-        incrementCustomerId(nextId)
-
-        // Register custom audit log entry
-        logEntryDao.insertLog(
-            LogEntry(
-                phone = rawNumber,
+            val candidateContact = Contact(
+                name = clientName,
+                phone = normalized,
+                originalPhone = rawNumber,
                 source = source,
-                status = if (isSynced) "تم الحفظ تلقائياً" else "خطأ في الحفظ ومكتنز محلياً",
-                details = "تم حفظ $clientName برقم $rawNumber بنجاح. المزامنة للهاتف: ${if (isSynced) "مكتمل" else "فشل (انتظار صلاحيات)"}"
+                isSyncedToPhone = false
             )
-        )
+            val insertedRowId = contactDao.insertContactIfAbsent(candidateContact)
+            if (insertedRowId <= 0L) {
+                // Concurrent or unique-index collision -> guaranteed no duplicate
+                return@withLock false
+            }
 
-        // Push notify user
-        NotificationHelper.showNotification(
-            context,
-            "تم حفظ عميل جديد تلقائياً 👤",
-            "تم التعرف على تواصل من رقم جديد وحفظه باسم '$clientName'"
-        )
+            // Increment customer counter for future unique names
+            incrementCustomerId(nextId)
 
-        // Record contact against free limit (100) or active subscription quota
-        subscriptionRepo.recordContactSaved(context)
-        subscriptionRepo.syncSingleClientToDatabase(context, newContact, isDeleted = false)
+            // Sync to native phone contacts or Google account contacts
+            val googleSyncEnabled = settingDao.getSetting("google_sync_enabled")?.value == "1"
+            val gmailAccount = settingDao.getSetting("gmail_account")?.value ?: ""
+            val isSynced = if (googleSyncEnabled && gmailAccount.isNotBlank()) {
+                ContactsManager.saveToGoogleContacts(context, clientName, rawNumber, gmailAccount)
+            } else {
+                ContactsManager.saveToNativeContacts(context, clientName, rawNumber)
+            }
 
-        return@withContext true
+            val finalContact = candidateContact.copy(
+                id = insertedRowId.toInt(),
+                isSyncedToPhone = isSynced
+            )
+            if (isSynced) {
+                contactDao.updateContact(finalContact)
+            }
+
+            // Register single event and single audit log entry for this number
+            val alreadyLoggedEvent = phoneEventDao.getAllEventsSync().any { event ->
+                PhoneNumberUtils.areNumbersEqual(event.phone, rawNumber)
+            }
+            if (!alreadyLoggedEvent) {
+                phoneEventDao.insertEvent(
+                    PhoneEvent(
+                        phone = rawNumber,
+                        type = source,
+                        content = contentSnippet.ifEmpty { "تواصل متبادل عبر $source" }
+                    )
+                )
+            }
+            val alreadyLoggedSave = logEntryDao.getAllLogsSync().any { entry ->
+                (entry.status == "تم الحفظ تلقائياً" || entry.status == "خطأ في الحفظ ومكتنز محلياً") &&
+                    PhoneNumberUtils.areNumbersEqual(entry.phone, rawNumber)
+            }
+            if (!alreadyLoggedSave) {
+                logEntryDao.insertLog(
+                    LogEntry(
+                        phone = rawNumber,
+                        source = source,
+                        status = if (isSynced) "تم الحفظ تلقائياً" else "خطأ في الحفظ ومكتنز محلياً",
+                        details = "تم حفظ $clientName برقم $rawNumber بنجاح. المزامنة للهاتف: ${if (isSynced) "مكتمل" else "فشل (انتظار صلاحيات)"}"
+                    )
+                )
+            }
+
+            NotificationHelper.showNotification(
+                context,
+                "تم حفظ عميل جديد تلقائياً 👤",
+                "تم التعرف على تواصل من رقم جديد وحفظه باسم '$clientName'"
+            )
+
+            // Record contact against free limit (100) or active subscription quota and sync to server
+            subscriptionRepo.recordContactSaved(context)
+            subscriptionRepo.syncSingleClientToDatabase(context, finalContact, isDeleted = false)
+
+            return@withLock true
+        }
     }
 
     /**
