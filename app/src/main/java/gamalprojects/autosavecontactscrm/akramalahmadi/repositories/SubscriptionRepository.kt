@@ -237,8 +237,16 @@ class SubscriptionRepository(
     }
 
     fun observeLockReason(): Flow<String?> {
-        return settingDao.getSettingFlow(KEY_LOCK_REASON).map { setting ->
-            setting?.value?.takeIf { it.isNotBlank() }
+        return combine(
+            settingDao.getSettingFlow(KEY_LOCK_REASON),
+            observeFreeAccessState(),
+            observeActiveSubscription()
+        ) { setting, freeState, activeSub ->
+            if (activeSub != null || !freeState.isExhausted) {
+                null
+            } else {
+                setting?.value?.takeIf { it.isNotBlank() }
+            }
         }
     }
 
@@ -260,21 +268,30 @@ class SubscriptionRepository(
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
         val freeState = getFreeAccessStateSync()
         val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
-        val explicitlyLocked = settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1"
         val now = System.currentTimeMillis()
 
         val cached = activeCodeKey?.takeIf { it.isNotBlank() }?.let { codeDao.getCode(it) }
         if (cached != null) {
             if (cached.expiresAt == null || now >= cached.expiresAt) {
-                val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
                 settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
+                if (!freeState.isExhausted) {
+                    settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+                    settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+                    return@withContext LocalAccessDecision(null, freeState, isAllowed = true, errorMessage = null)
+                }
+                val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
                 settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
                 settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
                 return@withContext LocalAccessDecision(null, freeState, isAllowed = false, errorMessage = msg)
             }
             if (cached.maxContacts != null && cached.maxContacts > 0 && cached.usedContacts >= cached.maxContacts) {
-                val msg = "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
                 settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
+                if (!freeState.isExhausted) {
+                    settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+                    settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+                    return@withContext LocalAccessDecision(null, freeState, isAllowed = true, errorMessage = null)
+                }
+                val msg = "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
                 settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
                 settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
                 return@withContext LocalAccessDecision(null, freeState, isAllowed = false, errorMessage = msg)
@@ -291,17 +308,28 @@ class SubscriptionRepository(
             }
         }
 
-        val allowFree = !freeState.isExhausted && !explicitlyLocked
-        val reason = if (allowFree) {
-            null
-        } else {
-            settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
-                ?: if (freeState.isExhausted) MSG_FREE_LIMIT_REACHED else null
+        // As long as Free Plan (< 100 contacts) is still active, never lock out or surface expired-code messages
+        if (!freeState.isExhausted) {
+            if (settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1") {
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+            }
+            if (!settingDao.getSetting(KEY_LOCK_REASON)?.value.isNullOrBlank()) {
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+            }
+            return@withContext LocalAccessDecision(
+                activeInfo = null,
+                freeAccessState = freeState,
+                isAllowed = true,
+                errorMessage = null
+            )
         }
+
+        val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
+            ?: MSG_FREE_LIMIT_REACHED
         LocalAccessDecision(
             activeInfo = null,
             freeAccessState = freeState,
-            isAllowed = allowFree,
+            isAllowed = false,
             errorMessage = reason
         )
     }
@@ -318,7 +346,7 @@ class SubscriptionRepository(
         val freeState = getFreeAccessStateSync()
         val totalContacts = contactDao.getContactsCountSync()
         val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
-        val explicitlyLocked = settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1"
+        val explicitlyLocked = freeState.isExhausted && (settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1")
 
         upsertUserProfile(snapshot, activeCode = activeCodeKey?.takeIf { it.isNotBlank() })
 
@@ -330,23 +358,42 @@ class SubscriptionRepository(
 
         // Local expiration guard (still queries server afterwards in case admin renewed a subscription for this device)
         if (cached != null && (cached.expiresAt == null || now >= cached.expiresAt)) {
-            val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
             settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
-            settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
-            settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
             upsertUserProfile(snapshot, activeCode = null)
             effectiveActiveCodeKey = null
             effectiveCached = null
-            effectiveExplicitlyLocked = true
+            if (freeState.isExhausted) {
+                val msg = "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
+                effectiveExplicitlyLocked = true
+            } else {
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+                effectiveExplicitlyLocked = false
+            }
         } else if (cached != null && cached.maxContacts != null && cached.maxContacts > 0 && cached.usedContacts >= cached.maxContacts) {
-            val msg = "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
             settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
-            settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
-            settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
             upsertUserProfile(snapshot, activeCode = null)
             effectiveActiveCodeKey = null
             effectiveCached = null
-            effectiveExplicitlyLocked = true
+            if (freeState.isExhausted) {
+                val msg = "تم استهلاك الحد الأقصى لجهات الاتصال (${cached.maxContacts} جهة اتصال). يرجى تجديد أو ترقية الاشتراك."
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
+                effectiveExplicitlyLocked = true
+            } else {
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+                effectiveExplicitlyLocked = false
+            }
+        } else if (!freeState.isExhausted) {
+            if (settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1") {
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+            }
+            if (!settingDao.getSetting(KEY_LOCK_REASON)?.value.isNullOrBlank()) {
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+            }
         }
 
         val api = resolveApiService()
@@ -366,33 +413,24 @@ class SubscriptionRepository(
             return@withContext outcome
         }
 
-        // Server not configured yet: allow free usage up to 100 or valid cached code, prompt to contact owner
+        // Server not configured yet: allow free usage up to 100 or valid cached code
         val notConfiguredStatus = DbConnectionStatus.NotConfigured(MSG_DB_NOT_CONFIGURED)
-        if (!effectiveActiveCodeKey.isNullOrBlank()) {
-            if (effectiveCached != null && effectiveCached.isActive && effectiveCached.isSubscribed &&
-                effectiveCached.expiresAt != null && now < effectiveCached.expiresAt &&
-                (effectiveCached.boundUserId.isNullOrBlank() || effectiveCached.boundUserId == snapshot.userId)
-            ) {
-                return@withContext SessionVerifyOutcome(
-                    activeInfo = effectiveCached.toActiveInfo(snapshot),
-                    freeAccessState = freeState,
-                    isAllowed = true,
-                    dbStatus = notConfiguredStatus,
-                    errorMessage = null,
-                    isConnectionError = false
-                )
-            }
+        if (!effectiveActiveCodeKey.isNullOrBlank() &&
+            effectiveCached != null && effectiveCached.isActive && effectiveCached.isSubscribed &&
+            effectiveCached.expiresAt != null && now < effectiveCached.expiresAt &&
+            (effectiveCached.boundUserId.isNullOrBlank() || effectiveCached.boundUserId == snapshot.userId)
+        ) {
             return@withContext SessionVerifyOutcome(
-                activeInfo = null,
+                activeInfo = effectiveCached.toActiveInfo(snapshot),
                 freeAccessState = freeState,
-                isAllowed = !freeState.isExhausted && !effectiveExplicitlyLocked,
+                isAllowed = true,
                 dbStatus = notConfiguredStatus,
-                errorMessage = if (!freeState.isExhausted && !effectiveExplicitlyLocked) null else MSG_DB_NOT_CONFIGURED,
-                isConnectionError = true
+                errorMessage = null,
+                isConnectionError = false
             )
         }
 
-        if (!freeState.isExhausted && !effectiveExplicitlyLocked) {
+        if (!freeState.isExhausted) {
             return@withContext SessionVerifyOutcome(
                 activeInfo = null,
                 freeAccessState = freeState,
@@ -404,7 +442,7 @@ class SubscriptionRepository(
         }
 
         val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
-            ?: if (freeState.isExhausted) MSG_FREE_LIMIT_REACHED else null
+            ?: MSG_FREE_LIMIT_REACHED
         return@withContext SessionVerifyOutcome(
             activeInfo = null,
             freeAccessState = freeState,
@@ -503,7 +541,7 @@ class SubscriptionRepository(
                         return SessionVerifyOutcome(info, effectiveFreeState, true, dbStatus, null, false)
                     }
                 }
-                if (!effectiveFreeState.isExhausted && !explicitlyLocked) {
+                if (!effectiveFreeState.isExhausted) {
                     return SessionVerifyOutcome(null, effectiveFreeState, true, dbStatus, null, false)
                 }
                 val reason = settingDao.getSetting(KEY_LOCK_REASON)?.value?.takeIf { it.isNotBlank() }
@@ -536,20 +574,33 @@ class SubscriptionRepository(
                     val info = persistActiveSubscription(activeCodeKey, body, snapshot, existingUsed = cachedUsedQuota, existingExpiresAt = cachedCode?.expiresAt)
                     SessionVerifyOutcome(info, effectiveFreeState, true, connectedStatus, null, false)
                 } else {
-                    val err = failureReason ?: MSG_CONTACT_OWNER_OFFLINE
                     settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
-                    settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
-                    settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, err))
                     upsertUserProfile(snapshot, activeCode = null)
-                    SessionVerifyOutcome(null, effectiveFreeState, false, connectedStatus, err, false)
+                    if (!effectiveFreeState.isExhausted) {
+                        settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+                        settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+                        SessionVerifyOutcome(null, effectiveFreeState, true, connectedStatus, null, false)
+                    } else {
+                        val err = failureReason ?: MSG_CONTACT_OWNER_OFFLINE
+                        settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+                        settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, err))
+                        SessionVerifyOutcome(null, effectiveFreeState, false, connectedStatus, err, false)
+                    }
                 }
             } else {
                 val serverErr = extractErrorMessage(response.errorBody()?.string())
                 if (response.code() in setOf(400, 403, 409, 422) && serverErr != null) {
                     settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
-                    settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
-                    settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, serverErr))
-                    SessionVerifyOutcome(null, effectiveFreeState, false, DbConnectionStatus.Connected("متصل"), serverErr, false)
+                    upsertUserProfile(snapshot, activeCode = null)
+                    if (!effectiveFreeState.isExhausted) {
+                        settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+                        settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+                        SessionVerifyOutcome(null, effectiveFreeState, true, DbConnectionStatus.Connected("متصل"), null, false)
+                    } else {
+                        settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+                        settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, serverErr))
+                        SessionVerifyOutcome(null, effectiveFreeState, false, DbConnectionStatus.Connected("متصل"), serverErr, false)
+                    }
                 } else {
                     offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked)
                 }
@@ -591,8 +642,8 @@ class SubscriptionRepository(
                 isConnectionError = false
             )
         }
-        val allowFree = !freeState.isExhausted && !explicitlyLocked
-        val reason = if (allowFree) null else MSG_CONTACT_OWNER_OFFLINE
+        val allowFree = !freeState.isExhausted
+        val reason = if (allowFree) null else MSG_FREE_LIMIT_REACHED
         return SessionVerifyOutcome(
             activeInfo = null,
             freeAccessState = freeState,
@@ -778,25 +829,38 @@ class SubscriptionRepository(
 
     suspend fun canSaveNewContact(): Boolean = withContext(Dispatchers.IO) {
         val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
-        if (activeCodeKey.isNullOrBlank()) {
-            val explicitlyLocked = settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1"
-            if (explicitlyLocked) return@withContext false
-            val freeState = getFreeAccessStateSync()
-            return@withContext !freeState.isExhausted && freeState.usedContacts < FREE_CONTACTS_LIMIT
-        }
-        val entity = codeDao.getCode(activeCodeKey) ?: return@withContext false
-        if (!entity.isSubscribed || !entity.isActive) return@withContext false
-        val now = System.currentTimeMillis()
-        if (entity.expiresAt == null || now >= entity.expiresAt) {
-            val msg = "انتهت مدة اشتراكك الحالية. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم $ADMIN_PHONE_DISPLAY"
+        if (!activeCodeKey.isNullOrBlank()) {
+            val entity = codeDao.getCode(activeCodeKey)
+            val now = System.currentTimeMillis()
+            val validSub = entity != null &&
+                entity.isSubscribed &&
+                entity.isActive &&
+                entity.expiresAt != null &&
+                now < entity.expiresAt &&
+                (entity.maxContacts == null || entity.maxContacts <= 0 || entity.usedContacts < entity.maxContacts)
+            if (validSub) {
+                return@withContext true
+            }
+            // Clear expired/exhausted code silently; fall back cleanly to Free Plan if quota < 100 remains
             settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
-            settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
-            settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, msg))
-            return@withContext false
         }
-        val max = entity.maxContacts
-        if (max != null && max > 0 && entity.usedContacts >= max) return@withContext false
-        true
+
+        val freeState = getFreeAccessStateSync()
+        if (!freeState.isExhausted && freeState.usedContacts < FREE_CONTACTS_LIMIT) {
+            if (settingDao.getSetting(KEY_SUBSCRIPTION_LOCKED)?.value == "1") {
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+            }
+            if (!settingDao.getSetting(KEY_LOCK_REASON)?.value.isNullOrBlank()) {
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+            }
+            return@withContext true
+        }
+
+        settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
+        if (settingDao.getSetting(KEY_LOCK_REASON)?.value.isNullOrBlank()) {
+            settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, MSG_FREE_LIMIT_REACHED))
+        }
+        false
     }
 
     suspend fun recordContactSaved(context: Context): Boolean = withContext(Dispatchers.IO) {
@@ -864,10 +928,16 @@ class SubscriptionRepository(
         syncUsageToBackend(context, updated.code, nextUsed)
 
         if (reachedLimit) {
+            settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
+            val freeState = getFreeAccessStateSync()
+            if (!freeState.isExhausted) {
+                settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
+                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, ""))
+                return@withContext true
+            }
             val lockMessage = "تم استهلاك الحد الأقصى لحفظ جهات الاتصال ($max جهة اتصال). يرجى إدخال كود اشتراك جديد."
             settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, lockMessage))
             settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "1"))
-            settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, ""))
             NotificationHelper.showNotification(
                 context,
                 "انتهى حد الباقة الحالية",

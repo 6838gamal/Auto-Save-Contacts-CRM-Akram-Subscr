@@ -71,10 +71,11 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
 
     val hasAppAccess: StateFlow<Boolean> = combine(
         _activeSubscription,
-        _freeAccessState,
-        _isExplicitlyLocked
-    ) { active, free, locked ->
-        active != null || (!free.isExhausted && !locked)
+        _freeAccessState
+    ) { active, free ->
+        val now = System.currentTimeMillis()
+        val validActive = active != null && !active.isExpired(now) && !active.isQuotaReached()
+        validActive || !free.isExhausted
     }.stateIn(viewModelScope, SharingStarted.Eagerly, true)
 
     private val _nowMillis = MutableStateFlow(System.currentTimeMillis())
@@ -123,6 +124,12 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                 if (!reason.isNullOrBlank()) {
                     _gateError.value = reason
                     _isConnectionError.value = false
+                } else {
+                    val currentErr = _gateError.value.orEmpty()
+                    if (currentErr.contains("انته") || currentErr.contains("الحد المجاني") || currentErr.contains("الحد الأقصى")) {
+                        _gateError.value = null
+                        _isConnectionError.value = false
+                    }
                 }
             }
         }
@@ -149,11 +156,20 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                 val current = _activeSubscription.value
                 if (current != null && current.isExpired(now)) {
                     _activeSubscription.value = null
-                    _isExplicitlyLocked.value = true
-                    _isConnectionError.value = false
-                    _gateError.value =
-                        "انتهت مدة اشتراكك الحالية. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم ${SubscriptionRepository.ADMIN_PHONE_DISPLAY}"
-                    repo.lockSession(explicitLock = true)
+                    val freeExhausted = _freeAccessState.value.isExhausted
+                    if (freeExhausted) {
+                        _isExplicitlyLocked.value = true
+                        _isConnectionError.value = false
+                        _gateError.value =
+                            "انتهت مدة اشتراكك الحالية. يرجى إدخال كود جديد (5 أشهر أو 12 شهراً) أو التواصل مع الإدارة على الرقم ${SubscriptionRepository.ADMIN_PHONE_DISPLAY}"
+                        repo.lockSession(explicitLock = true)
+                    } else {
+                        _isExplicitlyLocked.value = false
+                        _isConnectionError.value = false
+                        _gateError.value = null
+                        repo.lockSession(explicitLock = false)
+                        repo.clearLockReason()
+                    }
                 }
             }
         }
@@ -231,11 +247,17 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                 _freeAccessState.value = outcome.freeAccessState
                 _dbConnectionStatus.value = outcome.dbStatus
                 _isExplicitlyLocked.value =
-                    !outcome.isAllowed && outcome.activeInfo == null && !outcome.freeAccessState.isExhausted
+                    !outcome.isAllowed && outcome.activeInfo == null && outcome.freeAccessState.isExhausted
                 if (outcome.activeInfo != null) {
                     _gateError.value = null
                     _isConnectionError.value = false
                     onAutoUnlocked?.invoke()
+                } else if (outcome.isAllowed && !outcome.freeAccessState.isExhausted) {
+                    val currentErr = _gateError.value.orEmpty()
+                    if (currentErr.contains("انته") || currentErr.contains("الحد المجاني") || currentErr.contains("الحد الأقصى")) {
+                        _gateError.value = null
+                        _isConnectionError.value = false
+                    }
                 }
             } catch (_: Throwable) {
                 if (repo.isDatabaseConfigured() && _dbConnectionStatus.value !is DbConnectionStatus.Connected) {
@@ -270,8 +292,11 @@ class SubscriptionViewModel(application: Application) : AndroidViewModel(applica
                 _activeSubscription.value = quick.activeInfo
                 _freeAccessState.value = quick.freeAccessState
                 _isExplicitlyLocked.value =
-                    !quick.isAllowed && quick.activeInfo == null && !quick.freeAccessState.isExhausted
-                if (!quick.isAllowed) {
+                    !quick.isAllowed && quick.activeInfo == null && quick.freeAccessState.isExhausted
+                if (quick.isAllowed) {
+                    _gateError.value = null
+                    _isConnectionError.value = false
+                } else {
                     _gateError.value = quick.errorMessage
                 }
                 onResult(quick.isAllowed)

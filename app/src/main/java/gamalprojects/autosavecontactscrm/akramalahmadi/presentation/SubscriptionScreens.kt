@@ -89,6 +89,14 @@ fun SubscriptionGateScreen(
 
     var codeInput by remember { mutableStateOf("") }
 
+    DisposableEffect(canNavigateBack) {
+        onDispose {
+            if (canNavigateBack) {
+                subscriptionViewModel.clearGateError()
+            }
+        }
+    }
+
     LaunchedEffect(gateError) {
         if (!gateError.isNullOrBlank()) {
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)

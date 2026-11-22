@@ -1265,4 +1265,104 @@ class SubscriptionManagerTest {
         assertEquals(gamalprojects.autosavecontactscrm.akramalahmadi.repositories.SubscriptionPlanTier.FIVE_MONTHS, outcome.activeInfo!!.planTier)
         assertTrue(repo.canSaveNewContact())
     }
+
+    @Test
+    fun `active free plan under 100 contacts never locks or shows expired code message despite stale expired code`() = runTest {
+        val past = System.currentTimeMillis() - 86_400_000L
+        db.subscriptionCodeDao().upsertCode(
+            SubscriptionCodeEntity(
+                code = "STALE-EXPIRED-5M",
+                label = "باقة 5 أشهر",
+                durationMinutes = 216_000L,
+                isLifetime = false,
+                isSubscribed = true,
+                isActive = true,
+                activatedAt = past - 10_000_000L,
+                expiresAt = past
+            )
+        )
+        db.settingDao().insertSetting(SettingEntity("active_subscription_code", "STALE-EXPIRED-5M"))
+        db.settingDao().insertSetting(SettingEntity("subscription_explicitly_locked", "1"))
+        db.settingDao().insertSetting(
+            SettingEntity("subscription_lock_reason", "انتهت مدة كود الاشتراك الخاص بك. يرجى إدخال كود جديد")
+        )
+        db.settingDao().insertSetting(SettingEntity("free_contacts_used", "5"))
+
+        val expiredServerApi = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> = Response.success(
+                SubscriptionApiResponse(
+                    valid = false,
+                    isSubscribed = false,
+                    isActive = false,
+                    message = "انتهى كود الاشتراك"
+                )
+            )
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = false))
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> = Response.success(
+                SubscriptionApiResponse(valid = false, isSubscribed = false, isActive = false, message = "انتهى كود الاشتراك")
+            )
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun syncClients(
+                authorization: String?,
+                apiKey: String?,
+                request: ClientSyncBatchRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+        }
+
+        val repo = SubscriptionRepository(db, apiServiceOverride = expiredServerApi)
+
+        // 1. Instant local check clears stale lock & expired code and allows Free Plan access
+        val quick = repo.checkLocalAccessQuick(context)
+        assertTrue(quick.isAllowed)
+        assertNull(quick.activeInfo)
+        assertNull(quick.errorMessage)
+        assertFalse(quick.freeAccessState.isExhausted)
+        assertEquals("0", db.settingDao().getSetting("subscription_explicitly_locked")?.value)
+        assertEquals("", db.settingDao().getSetting("subscription_lock_reason")?.value)
+
+        // 2. Server verification while < 100 contacts also allows Free Plan access without surfacing expiry error
+        val verify = repo.verifyCurrentSession(context)
+        assertTrue(verify.isAllowed)
+        assertNull(verify.activeInfo)
+        assertNull(verify.errorMessage)
+        assertTrue(repo.canSaveNewContact())
+
+        // 3. Exhaust remaining 95 contacts -> only THEN does Free Plan lock engage
+        repeat(94) {
+            assertTrue(repo.recordContactSaved(context))
+        }
+        assertFalse(repo.recordContactSaved(context))
+        assertFalse(repo.canSaveNewContact())
+
+        val exhaustedVerify = repo.verifyCurrentSession(context)
+        assertFalse(exhaustedVerify.isAllowed)
+        assertTrue(exhaustedVerify.freeAccessState.isExhausted)
+        assertNotNull(exhaustedVerify.errorMessage)
+    }
 }
