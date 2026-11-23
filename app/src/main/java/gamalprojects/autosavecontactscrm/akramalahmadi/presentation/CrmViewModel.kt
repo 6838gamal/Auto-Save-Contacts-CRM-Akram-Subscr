@@ -10,6 +10,7 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.SettingEntity
 import gamalprojects.autosavecontactscrm.akramalahmadi.export.ExportManager
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.PermissionManager
+import gamalprojects.autosavecontactscrm.akramalahmadi.managers.WhatsAppMonitoringConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ContactsRepository
 import gamalprojects.autosavecontactscrm.akramalahmadi.services.AutoSaveForegroundService
 import kotlinx.coroutines.flow.*
@@ -32,16 +33,17 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
     private val _logFilterSource = MutableStateFlow("الكل")
     val logFilterSource: StateFlow<String> = _logFilterSource.asStateFlow()
 
+    private val _contactFilterSource = MutableStateFlow("الكل")
+    val contactFilterSource: StateFlow<String> = _contactFilterSource.asStateFlow()
+
     // CRM Contacts Flow
-    val contacts: StateFlow<List<Contact>> = combine(repo.allContacts, _searchQuery) { list, query ->
-        if (query.isBlank()) {
-            list
-        } else {
-            list.filter {
-                it.name.contains(query, ignoreCase = true) || 
-                it.phone.contains(query) || 
-                it.originalPhone.contains(query)
-            }
+    val contacts: StateFlow<List<Contact>> = combine(repo.allContacts, _searchQuery, _contactFilterSource) { list, query, sourceFilter ->
+        list.filter { contact ->
+            val matchesQuery = query.isBlank() ||
+                contact.name.contains(query, ignoreCase = true) ||
+                contact.phone.contains(query) ||
+                contact.originalPhone.contains(query)
+            matchesQuery && matchesContactFilter(contact, sourceFilter)
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -70,6 +72,25 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _batteryOptimizationIgnored = MutableStateFlow(false)
     val batteryOptimizationIgnored: StateFlow<Boolean> = _batteryOptimizationIgnored.asStateFlow()
+
+    // Independent WhatsApp vs WhatsApp Business installation & monitoring states
+    private val _whatsAppInstalled = MutableStateFlow(false)
+    val whatsAppInstalled: StateFlow<Boolean> = _whatsAppInstalled.asStateFlow()
+
+    private val _whatsAppBusinessInstalled = MutableStateFlow(false)
+    val whatsAppBusinessInstalled: StateFlow<Boolean> = _whatsAppBusinessInstalled.asStateFlow()
+
+    private val _whatsAppNotifEnabled = MutableStateFlow(true)
+    val whatsAppNotifEnabled: StateFlow<Boolean> = _whatsAppNotifEnabled.asStateFlow()
+
+    private val _whatsAppBusinessNotifEnabled = MutableStateFlow(true)
+    val whatsAppBusinessNotifEnabled: StateFlow<Boolean> = _whatsAppBusinessNotifEnabled.asStateFlow()
+
+    private val _whatsAppAccessEnabled = MutableStateFlow(true)
+    val whatsAppAccessEnabled: StateFlow<Boolean> = _whatsAppAccessEnabled.asStateFlow()
+
+    private val _whatsAppBusinessAccessEnabled = MutableStateFlow(true)
+    val whatsAppBusinessAccessEnabled: StateFlow<Boolean> = _whatsAppBusinessAccessEnabled.asStateFlow()
 
     // Theme state (Dark/Light Mode)
     private val _isDarkMode = MutableStateFlow(true)
@@ -123,8 +144,12 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
         _logFilterSource.value = source
     }
 
+    fun setContactFilterSource(source: String) {
+        _contactFilterSource.value = source
+    }
+
     /**
-     * Checks all required permissions on demand.
+     * Checks all required permissions and per-app WhatsApp / WhatsApp Business monitoring toggles on demand.
      */
     fun checkAllPermissionStates() {
         val context = getApplication<Application>()
@@ -135,6 +160,13 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
         _accessibilityAccessGranted.value = PermissionManager.isAccessibilityServiceEnabled(context)
         _batteryOptimizationIgnored.value = PermissionManager.isIgnoringBatteryOptimization(context)
 
+        _whatsAppInstalled.value = WhatsAppMonitoringConfig.isWhatsAppInstalled(context)
+        _whatsAppBusinessInstalled.value = WhatsAppMonitoringConfig.isWhatsAppBusinessInstalled(context)
+        _whatsAppNotifEnabled.value = WhatsAppMonitoringConfig.isWhatsAppNotificationMonitoringEnabled(context)
+        _whatsAppBusinessNotifEnabled.value = WhatsAppMonitoringConfig.isWhatsAppBusinessNotificationMonitoringEnabled(context)
+        _whatsAppAccessEnabled.value = WhatsAppMonitoringConfig.isWhatsAppAccessibilityMonitoringEnabled(context)
+        _whatsAppBusinessAccessEnabled.value = WhatsAppMonitoringConfig.isWhatsAppBusinessAccessibilityMonitoringEnabled(context)
+
         val userPaused = isMonitoringManuallyPaused(context)
         val inUnlockedApp = _currentScreen.value != Screen.SPLASH && _currentScreen.value != Screen.SUBSCRIPTION_GATE
         if (inUnlockedApp && !userPaused && (hasNotifPerm || allPerms) && !AutoSaveForegroundService.isRunning) {
@@ -142,6 +174,34 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
         }
         _isServiceRunning.value = AutoSaveForegroundService.isRunning ||
             (!userPaused && AutoSaveForegroundService.isMonitoringEnabled(context) && (hasNotifPerm || allPerms))
+    }
+
+    fun toggleWhatsAppNotificationMonitoring() {
+        val context = getApplication<Application>()
+        val next = !_whatsAppNotifEnabled.value
+        WhatsAppMonitoringConfig.setWhatsAppNotificationMonitoringEnabled(context, next)
+        _whatsAppNotifEnabled.value = next
+    }
+
+    fun toggleWhatsAppBusinessNotificationMonitoring() {
+        val context = getApplication<Application>()
+        val next = !_whatsAppBusinessNotifEnabled.value
+        WhatsAppMonitoringConfig.setWhatsAppBusinessNotificationMonitoringEnabled(context, next)
+        _whatsAppBusinessNotifEnabled.value = next
+    }
+
+    fun toggleWhatsAppAccessibilityMonitoring() {
+        val context = getApplication<Application>()
+        val next = !_whatsAppAccessEnabled.value
+        WhatsAppMonitoringConfig.setWhatsAppAccessibilityMonitoringEnabled(context, next)
+        _whatsAppAccessEnabled.value = next
+    }
+
+    fun toggleWhatsAppBusinessAccessibilityMonitoring() {
+        val context = getApplication<Application>()
+        val next = !_whatsAppBusinessAccessEnabled.value
+        WhatsAppMonitoringConfig.setWhatsAppBusinessAccessibilityMonitoringEnabled(context, next)
+        _whatsAppBusinessAccessEnabled.value = next
     }
 
     /**
@@ -356,15 +416,37 @@ enum class Screen {
     SETTINGS
 }
 
+internal fun matchesContactFilter(contact: Contact, filter: String): Boolean {
+    if (filter == "الكل") return true
+    val src = contact.source.trim()
+    return when (filter) {
+        "واتساب" -> src == WhatsAppMonitoringConfig.SOURCE_WHATSAPP ||
+            (src.contains("whatsapp", ignoreCase = true) && !src.contains("business", ignoreCase = true) && !src.contains("w4b", ignoreCase = true))
+        "واتساب الأعمال" -> src == WhatsAppMonitoringConfig.SOURCE_WHATSAPP_BUSINESS ||
+            src.contains("business", ignoreCase = true) ||
+            src.contains("w4b", ignoreCase = true)
+        "مكالمة" -> src.contains("مكالمة")
+        "رسالة SMS" -> src == "رسالة SMS"
+        else -> src == filter
+    }
+}
+
 internal fun matchesLogFilter(log: LogEntry, filter: String): Boolean {
     if (filter == "الكل") return true
     val src = log.source.trim()
+    val details = log.details.trim()
+    val isBusinessWa = src == WhatsAppMonitoringConfig.SOURCE_WHATSAPP_BUSINESS ||
+        details.contains(WhatsAppMonitoringConfig.SOURCE_WHATSAPP_BUSINESS) ||
+        src.contains("business", ignoreCase = true) ||
+        src.contains("w4b", ignoreCase = true)
     return when (filter) {
-        "واتساب" -> src == "واتساب" ||
-            src == "واتساب الأعمال" ||
-            src.contains("واتساب", ignoreCase = true) ||
-            src.contains("whatsapp", ignoreCase = true) ||
-            src == "خدمة إمكانية الوصول"
+        "واتساب الأعمال" -> isBusinessWa
+        "واتساب" -> !isBusinessWa && (
+            src == WhatsAppMonitoringConfig.SOURCE_WHATSAPP ||
+                src == "خدمة إمكانية الوصول" ||
+                (src.contains("واتساب", ignoreCase = true) && !src.contains("الأعمال")) ||
+                src.contains("whatsapp", ignoreCase = true)
+            )
         "مكالمة واردة" -> src == "مكالمة واردة" || src == "مكالمة صادرة" || src.contains("مكالمة")
         "تعديل يدوي" -> src == "تعديل يدوي" || src == "حذف يدوي"
         else -> src == filter

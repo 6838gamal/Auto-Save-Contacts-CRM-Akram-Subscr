@@ -6,6 +6,7 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils
+import gamalprojects.autosavecontactscrm.akramalahmadi.managers.WhatsAppMonitoringConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ContactsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap
 class NotificationListenerServiceImpl : NotificationListenerService() {
 
     private val scope = CoroutineScope(Dispatchers.IO)
-    private lateinit var repo: ContactsRepository
+    internal lateinit var repo: ContactsRepository
     private val recentlyProcessed = ConcurrentHashMap<String, Long>()
 
     override fun onCreate() {
@@ -34,44 +35,89 @@ class NotificationListenerServiceImpl : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val packageName = sbn.packageName ?: return
-        
-        val sourceLabel = when (packageName) {
-            "com.whatsapp" -> "واتساب"
-            "com.whatsapp.w4b" -> "واتساب الأعمال"
-            else -> null
+        val extras = sbn.notification.extras ?: return
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+        processNotificationContent(packageName, title, text)
+    }
+
+    internal suspend fun processNotificationContentSync(
+        packageName: String?,
+        title: String,
+        text: String
+    ): Boolean {
+        val pkg = packageName ?: return false
+        val sourceLabel = WhatsAppMonitoringConfig.resolveNotificationSourceIfEnabled(applicationContext, pkg)
+        if (sourceLabel == null) {
+            if (pkg == WhatsAppMonitoringConfig.PKG_WHATSAPP || pkg == WhatsAppMonitoringConfig.PKG_WHATSAPP_BUSINESS) {
+                Log.d("NotificationListener", "Notification monitoring is disabled independently for $pkg; skipping.")
+            }
+            return false
         }
 
-        // WhatsApp & WhatsApp Business notification processing
-        if (sourceLabel != null) {
-            val extras = sbn.notification.extras ?: return
-            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
-            val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+        Log.i("NotificationListener", "$sourceLabel Notification Posted: Title: $title, Text: $text")
 
-            Log.i("NotificationListener", "$sourceLabel Notification Posted: Title: $title, Text: $text")
+        val potentialPhone = extractPhoneNumber(title)
+        if (potentialPhone == null) {
+            Log.d("NotificationListener", "$sourceLabel Notification Title contains letters or short, ignoring (probably saved contact): $title")
+            return false
+        }
 
-            val potentialPhone = extractPhoneNumber(title)
-            if (potentialPhone != null) {
-                val normalized = PhoneNumberUtils.normalize(potentialPhone)
-                val now = System.currentTimeMillis()
-                val lastSeen = recentlyProcessed[normalized]
-                if (normalized.length >= 7 && (lastSeen == null || (now - lastSeen) >= 60_000L)) {
-                    recentlyProcessed[normalized] = now
-                    if (recentlyProcessed.size > 500) {
-                        recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
-                    }
-                    Log.d("NotificationListener", "Found $sourceLabel phone number to parse: $potentialPhone")
-                    scope.launch {
-                        repo.processNewConnection(
-                            applicationContext,
-                            potentialPhone,
-                            sourceLabel,
-                            "رسالة $sourceLabel: ${text.take(60)}"
-                        )
-                    }
-                }
-            } else {
-                Log.d("NotificationListener", "$sourceLabel Notification Title contains letters or short, ignoring (probably saved contact): $title")
+        val normalized = PhoneNumberUtils.normalize(potentialPhone)
+        val now = System.currentTimeMillis()
+        val dedupKey = "$pkg:$normalized"
+        val lastSeen = recentlyProcessed[dedupKey]
+        if (normalized.length >= 7 && (lastSeen == null || (now - lastSeen) >= 60_000L)) {
+            recentlyProcessed[dedupKey] = now
+            if (recentlyProcessed.size > 500) {
+                recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
             }
+            Log.d("NotificationListener", "Found $sourceLabel phone number to parse: $potentialPhone")
+            return repo.processNewConnection(
+                applicationContext,
+                potentialPhone,
+                sourceLabel,
+                "رسالة $sourceLabel: ${text.take(60)}"
+            )
+        }
+        return false
+    }
+
+    internal fun processNotificationContent(packageName: String?, title: String, text: String) {
+        val pkg = packageName ?: return
+        val sourceLabel = WhatsAppMonitoringConfig.resolveNotificationSourceIfEnabled(applicationContext, pkg)
+        if (sourceLabel == null) {
+            if (pkg == WhatsAppMonitoringConfig.PKG_WHATSAPP || pkg == WhatsAppMonitoringConfig.PKG_WHATSAPP_BUSINESS) {
+                Log.d("NotificationListener", "Notification monitoring is disabled independently for $pkg; skipping.")
+            }
+            return
+        }
+
+        Log.i("NotificationListener", "$sourceLabel Notification Posted: Title: $title, Text: $text")
+
+        val potentialPhone = extractPhoneNumber(title)
+        if (potentialPhone != null) {
+            val normalized = PhoneNumberUtils.normalize(potentialPhone)
+            val now = System.currentTimeMillis()
+            val dedupKey = "$pkg:$normalized"
+            val lastSeen = recentlyProcessed[dedupKey]
+            if (normalized.length >= 7 && (lastSeen == null || (now - lastSeen) >= 60_000L)) {
+                recentlyProcessed[dedupKey] = now
+                if (recentlyProcessed.size > 500) {
+                    recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
+                }
+                Log.d("NotificationListener", "Found $sourceLabel phone number to parse: $potentialPhone")
+                scope.launch {
+                    repo.processNewConnection(
+                        applicationContext,
+                        potentialPhone,
+                        sourceLabel,
+                        "رسالة $sourceLabel: ${text.take(60)}"
+                    )
+                }
+            }
+        } else {
+            Log.d("NotificationListener", "$sourceLabel Notification Title contains letters or short, ignoring (probably saved contact): $title")
         }
     }
 

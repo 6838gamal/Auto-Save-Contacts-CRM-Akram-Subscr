@@ -1367,7 +1367,7 @@ class SubscriptionManagerTest {
     }
 
     @Test
-    fun `logs filter shows whatsapp business and whatsapp entries in both all and whatsapp tabs`() {
+    fun `logs filter separates whatsapp and whatsapp business entries independently`() {
         val regularWa = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
             phone = "+967777111222",
             source = "واتساب",
@@ -1386,6 +1386,12 @@ class SubscriptionManagerTest {
             status = "تم الحفظ تلقائياً",
             details = "التقاط من شاشة واتساب"
         )
+        val legacyAccessibilityW4b = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
+            phone = "+967777555999",
+            source = "خدمة إمكانية الوصول",
+            status = "تم الحفظ تلقائياً",
+            details = "التقاط من شاشة واتساب الأعمال"
+        )
         val smsLog = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
             phone = "+967777777888",
             source = "رسالة SMS",
@@ -1399,22 +1405,39 @@ class SubscriptionManagerTest {
             details = "مكالمة"
         )
 
-        val allEntries = listOf(regularWa, businessWa, legacyAccessibilityWa, smsLog, incomingCallLog)
+        val allEntries = listOf(
+            regularWa,
+            businessWa,
+            legacyAccessibilityWa,
+            legacyAccessibilityW4b,
+            smsLog,
+            incomingCallLog
+        )
 
         val inAll = allEntries.filter {
             gamalprojects.autosavecontactscrm.akramalahmadi.presentation.matchesLogFilter(it, "الكل")
         }
-        assertEquals(5, inAll.size)
+        assertEquals(6, inAll.size)
 
         val inWhatsappTab = allEntries.filter {
             gamalprojects.autosavecontactscrm.akramalahmadi.presentation.matchesLogFilter(it, "واتساب")
         }
-        assertEquals(3, inWhatsappTab.size)
+        assertEquals(2, inWhatsappTab.size)
         assertTrue(inWhatsappTab.contains(regularWa))
-        assertTrue(inWhatsappTab.contains(businessWa))
         assertTrue(inWhatsappTab.contains(legacyAccessibilityWa))
+        assertFalse(inWhatsappTab.contains(businessWa))
+        assertFalse(inWhatsappTab.contains(legacyAccessibilityW4b))
         assertFalse(inWhatsappTab.contains(smsLog))
         assertFalse(inWhatsappTab.contains(incomingCallLog))
+
+        val inWhatsappBusinessTab = allEntries.filter {
+            gamalprojects.autosavecontactscrm.akramalahmadi.presentation.matchesLogFilter(it, "واتساب الأعمال")
+        }
+        assertEquals(2, inWhatsappBusinessTab.size)
+        assertTrue(inWhatsappBusinessTab.contains(businessWa))
+        assertTrue(inWhatsappBusinessTab.contains(legacyAccessibilityW4b))
+        assertFalse(inWhatsappBusinessTab.contains(regularWa))
+        assertFalse(inWhatsappBusinessTab.contains(legacyAccessibilityWa))
     }
 
     @Test

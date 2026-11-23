@@ -6,6 +6,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.AppDatabase
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.PhoneNumberUtils
+import gamalprojects.autosavecontactscrm.akramalahmadi.managers.WhatsAppMonitoringConfig
 import gamalprojects.autosavecontactscrm.akramalahmadi.repositories.ContactsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap
 class ContactAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(Dispatchers.IO)
-    private lateinit var repo: ContactsRepository
+    internal lateinit var repo: ContactsRepository
     private val recentlyProcessed = ConcurrentHashMap<String, Long>()
 
     override fun onCreate() {
@@ -34,50 +35,96 @@ class ContactAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString() ?: return
+        val sourceLabel = WhatsAppMonitoringConfig.resolveAccessibilitySourceIfEnabled(applicationContext, packageName)
+            ?: return
 
-        val sourceLabel = when {
-            packageName == "com.whatsapp" -> "واتساب"
-            packageName == "com.whatsapp.w4b" -> "واتساب الأعمال"
-            packageName.contains("dialer") || packageName.contains("phone") -> "مكالمة / الهاتف"
-            else -> null
-        }
+        val rootNode = rootInActiveWindow ?: return
+        val candidates = LinkedHashSet<String>()
+        collectCandidateNumbers(rootNode, candidates)
+        if (candidates.isEmpty()) return
 
-        // Only monitor WhatsApp, WhatsApp Business, or Dialer layouts to preserve battery
-        if (sourceLabel != null) {
-            val rootNode = rootInActiveWindow ?: return
-            val candidates = LinkedHashSet<String>()
-            collectCandidateNumbers(rootNode, candidates)
-            if (candidates.isEmpty()) return
+        processAccessibilityCandidates(packageName, sourceLabel, candidates)
+    }
 
-            val now = System.currentTimeMillis()
-            val toProcess = candidates.filter { candidate ->
-                val norm = PhoneNumberUtils.normalize(candidate)
-                if (norm.length < 7) return@filter false
-                val lastSeen = recentlyProcessed[norm]
-                if (lastSeen != null && (now - lastSeen) < 60_000L) {
-                    false
-                } else {
-                    recentlyProcessed[norm] = now
-                    true
-                }
-            }
-            if (recentlyProcessed.size > 500) {
-                recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
-            }
-            if (toProcess.isEmpty()) return
-
-            scope.launch {
-                for (potentialNumber in toProcess) {
-                    Log.d("ContactAccessibility", "Detected potential number in $sourceLabel UI: $potentialNumber")
-                    repo.processNewConnection(
-                        applicationContext,
-                        potentialNumber,
-                        sourceLabel,
-                        "التقاط من شاشة $sourceLabel"
-                    )
-                }
+    internal fun processAccessibilityCandidates(
+        packageName: String,
+        sourceLabel: String,
+        candidates: Set<String>
+    ) {
+        val now = System.currentTimeMillis()
+        val toProcess = candidates.filter { candidate ->
+            val norm = PhoneNumberUtils.normalize(candidate)
+            if (norm.length < 7) return@filter false
+            val dedupKey = "$packageName:$norm"
+            val lastSeen = recentlyProcessed[dedupKey]
+            if (lastSeen != null && (now - lastSeen) < 60_000L) {
+                false
+            } else {
+                recentlyProcessed[dedupKey] = now
+                true
             }
         }
+        if (recentlyProcessed.size > 500) {
+            recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
+        }
+        if (toProcess.isEmpty()) return
+
+        scope.launch {
+            for (potentialNumber in toProcess) {
+                Log.d("ContactAccessibility", "Detected potential number in $sourceLabel UI: $potentialNumber")
+                repo.processNewConnection(
+                    applicationContext,
+                    potentialNumber,
+                    sourceLabel,
+                    "التقاط من شاشة $sourceLabel"
+                )
+            }
+        }
+    }
+
+    internal suspend fun processAccessibilityTextsSync(
+        packageName: String?,
+        texts: List<String>
+    ): Int {
+        val pkg = packageName ?: return 0
+        val sourceLabel = WhatsAppMonitoringConfig.resolveAccessibilitySourceIfEnabled(applicationContext, pkg)
+            ?: return 0
+
+        val candidates = LinkedHashSet<String>()
+        for (text in texts) {
+            val trimmed = text.trim()
+            if (trimmed.isNotEmpty()) {
+                extractRawNumberIfValid(trimmed)?.let { candidates.add(it) }
+            }
+        }
+        if (candidates.isEmpty()) return 0
+
+        val now = System.currentTimeMillis()
+        val toProcess = candidates.filter { candidate ->
+            val norm = PhoneNumberUtils.normalize(candidate)
+            if (norm.length < 7) return@filter false
+            val dedupKey = "$pkg:$norm"
+            val lastSeen = recentlyProcessed[dedupKey]
+            if (lastSeen != null && (now - lastSeen) < 60_000L) {
+                false
+            } else {
+                recentlyProcessed[dedupKey] = now
+                true
+            }
+        }
+        if (toProcess.isEmpty()) return 0
+
+        var savedCount = 0
+        for (potentialNumber in toProcess) {
+            val saved = repo.processNewConnection(
+                applicationContext,
+                potentialNumber,
+                sourceLabel,
+                "التقاط من شاشة $sourceLabel"
+            )
+            if (saved) savedCount++
+        }
+        return savedCount
     }
 
     private fun collectCandidateNumbers(node: AccessibilityNodeInfo?, out: MutableSet<String>) {

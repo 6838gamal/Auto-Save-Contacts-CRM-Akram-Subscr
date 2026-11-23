@@ -53,6 +53,7 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.R
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.Contact
 import gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry
 import gamalprojects.autosavecontactscrm.akramalahmadi.managers.PermissionManager
+import gamalprojects.autosavecontactscrm.akramalahmadi.managers.WhatsAppMonitoringConfig
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -543,6 +544,10 @@ fun DashboardScreen(
     val notifGranted by viewModel.notificationAccessGranted.collectAsStateWithLifecycle()
     val accessGranted by viewModel.accessibilityAccessGranted.collectAsStateWithLifecycle()
     val batteryIgnored by viewModel.batteryOptimizationIgnored.collectAsStateWithLifecycle()
+    val waNotifEnabled by viewModel.whatsAppNotifEnabled.collectAsStateWithLifecycle()
+    val w4bNotifEnabled by viewModel.whatsAppBusinessNotifEnabled.collectAsStateWithLifecycle()
+    val waAccessEnabled by viewModel.whatsAppAccessEnabled.collectAsStateWithLifecycle()
+    val w4bAccessEnabled by viewModel.whatsAppBusinessAccessEnabled.collectAsStateWithLifecycle()
 
     LaunchedEffect(key1 = true) {
         viewModel.checkAllPermissionStates()
@@ -749,11 +754,36 @@ fun DashboardScreen(
                     Text(text = "جاهزية الأنظمة المدمجة", fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     Spacer(modifier = Modifier.height(14.dp))
 
+                    val waAnyChannelEnabled = waNotifEnabled || waAccessEnabled
+                    val waActive = (notifGranted && waNotifEnabled) || (accessGranted && waAccessEnabled)
+                    val w4bAnyChannelEnabled = w4bNotifEnabled || w4bAccessEnabled
+                    val w4bActive = (notifGranted && w4bNotifEnabled) || (accessGranted && w4bAccessEnabled)
+
                     IntegrationItemRow("مراقبة المكالمات ورسائل الهاتف", permGranted)
                     Divider(modifier = Modifier.padding(vertical = 8.dp))
-                    IntegrationItemRow("رصد إشعارات WhatsApp (CRM)", notifGranted)
+                    IntegrationStatusItemRow(
+                        title = "واتساب (رصد الإشعارات والوصول)",
+                        statusText = when {
+                            waActive -> "مفعل ومستقر"
+                            !waAnyChannelEnabled -> "متوقف يدوياً"
+                            else -> "يحتاج تنشيط"
+                        },
+                        isActive = waActive,
+                        isManuallyPaused = !waAnyChannelEnabled && (notifGranted || accessGranted)
+                    )
                     Divider(modifier = Modifier.padding(vertical = 8.dp))
-                    IntegrationItemRow("บริการ إمكانية الوصول (Accessibility)", accessGranted)
+                    IntegrationStatusItemRow(
+                        title = "واتساب الأعمال (رصد الإشعارات والوصول)",
+                        statusText = when {
+                            w4bActive -> "مفعل ومستقر"
+                            !w4bAnyChannelEnabled -> "متوقف يدوياً"
+                            else -> "يحتاج تنشيط"
+                        },
+                        isActive = w4bActive,
+                        isManuallyPaused = !w4bAnyChannelEnabled && (notifGranted || accessGranted)
+                    )
+                    Divider(modifier = Modifier.padding(vertical = 8.dp))
+                    IntegrationItemRow("خدمة إمكانية الوصول (Accessibility)", accessGranted)
                     Divider(modifier = Modifier.padding(vertical = 8.dp))
                     IntegrationItemRow("تحسين استهلاك البطارية (مستبعد)", batteryIgnored)
                 }
@@ -773,7 +803,7 @@ fun DashboardScreen(
                         Text(text = "فكرة الحفظ الذكي المدمجة", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp)
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "بمجرد وصول أي اتصال أو رسالة SMS أو إشعار واتساب مجهول غير محفوظ على الهاتف، يتم تلقائيًا حفظ الرقم برمز مسلسل (عميل 1، عميل 2...) ويتم تسجيل كافة التفاعلات وتحديثها بشكل فوري وبدون تدخل منك.",
+                            text = "بمجرد وصول أي اتصال أو رسالة SMS أو إشعار واتساب أو واتساب الأعمال لرقم مجهول غير محفوظ على الهاتف، يتم تلقائيًا حفظ الرقم برمز مسلسل (عميل 1، عميل 2...) مع تخصيص مستقل لكل تطبيق.",
                             fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
                             lineHeight = 16.sp
@@ -787,24 +817,49 @@ fun DashboardScreen(
 
 @Composable
 fun IntegrationItemRow(title: String, isWorking: Boolean) {
+    IntegrationStatusItemRow(
+        title = title,
+        statusText = if (isWorking) "مفعل ومستقر" else "يحتاج تنشيط",
+        isActive = isWorking,
+        isManuallyPaused = false
+    )
+}
+
+@Composable
+fun IntegrationStatusItemRow(
+    title: String,
+    statusText: String,
+    isActive: Boolean,
+    isManuallyPaused: Boolean
+) {
+    val accentColor = when {
+        isActive -> Color(0xFF10B981)
+        isManuallyPaused -> Color(0xFF64748B)
+        else -> Color(0xFFF59E0B)
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(text = title, fontSize = 13.sp)
+        Text(text = title, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        Spacer(modifier = Modifier.width(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = if (isWorking) "مفعل ومستقر" else "يحتاج تنشيط",
-                color = if (isWorking) Color(0xFF10B981) else Color(0xFFF59E0B),
+                text = statusText,
+                color = accentColor,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold
             )
             Spacer(modifier = Modifier.width(6.dp))
             Icon(
-                imageVector = if (isWorking) Icons.Filled.CheckCircle else Icons.Filled.Cancel,
+                imageVector = when {
+                    isActive -> Icons.Filled.CheckCircle
+                    isManuallyPaused -> Icons.Filled.PauseCircle
+                    else -> Icons.Filled.Cancel
+                },
                 contentDescription = null,
-                tint = if (isWorking) Color(0xFF10B981) else Color(0xFFF59E0B),
+                tint = accentColor,
                 modifier = Modifier.size(18.dp)
             )
         }
@@ -816,6 +871,7 @@ fun SavedContactsScreen(viewModel: CrmViewModel) {
     val context = LocalContext.current
     val list by viewModel.contacts.collectAsStateWithLifecycle()
     val searchStr by viewModel.searchQuery.collectAsStateWithLifecycle()
+    val activeSourceFilter by viewModel.contactFilterSource.collectAsStateWithLifecycle()
 
     var showEditDialog by remember { mutableStateOf<Contact?>(null) }
     var showDeleteDialog by remember { mutableStateOf<Contact?>(null) }
@@ -838,13 +894,39 @@ fun SavedContactsScreen(viewModel: CrmViewModel) {
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp)
+                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)
                 .testTag("search_contacts_input"),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedContainerColor = MaterialTheme.colorScheme.surface,
                 unfocusedContainerColor = MaterialTheme.colorScheme.surface
             )
         )
+
+        // Source filter chips for independent WhatsApp / WhatsApp Business / Call / SMS browsing
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            val contactSources = listOf("الكل", "واتساب", "واتساب الأعمال", "مكالمة", "رسالة SMS")
+            contactSources.forEach { src ->
+                val selected = src == activeSourceFilter
+                FilterChip(
+                    selected = selected,
+                    onClick = { viewModel.setContactFilterSource(src) },
+                    label = {
+                        Text(
+                            text = src,
+                            fontSize = 11.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    },
+                    modifier = Modifier.testTag("contacts_filter_$src")
+                )
+            }
+        }
 
         if (list.isEmpty()) {
             Box(
@@ -1024,23 +1106,31 @@ fun ContactItemCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Connection badge source
+                // Connection badge source (independently styled for WhatsApp vs WhatsApp Business)
+                val isBusinessWa = contact.source == WhatsAppMonitoringConfig.SOURCE_WHATSAPP_BUSINESS
+                val isRegularWa = contact.source == WhatsAppMonitoringConfig.SOURCE_WHATSAPP
+                val badgeColor = when {
+                    isBusinessWa -> Color(0xFF0284C7)
+                    isRegularWa -> Color(0xFF10B981)
+                    else -> MaterialTheme.colorScheme.secondary
+                }
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
-                        .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.15f))
+                        .background(badgeColor.copy(alpha = 0.15f))
                         .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         val icon = when {
+                            isBusinessWa -> Icons.Default.Storefront
+                            isRegularWa -> Icons.Default.ChatBubble
                             contact.source.contains("مكالمة") -> Icons.Default.Phone
                             contact.source == "رسالة SMS" -> Icons.Default.Sms
-                            contact.source.contains("واتساب") -> Icons.Default.ChatBubble
                             else -> Icons.Default.SettingsAccessibility
                         }
-                        Icon(imageVector = icon, contentDescription = null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(12.dp))
+                        Icon(imageVector = icon, contentDescription = null, tint = badgeColor, modifier = Modifier.size(12.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text(text = contact.source, color = MaterialTheme.colorScheme.secondary, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                        Text(text = contact.source, color = badgeColor, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
 
@@ -1087,7 +1177,7 @@ fun LogsScreen(viewModel: CrmViewModel) {
                 .padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            val sources = listOf("الكل", "مكالمة واردة", "رسالة SMS", "واتساب", "تعديل يدوي")
+            val sources = listOf("الكل", "واتساب", "واتساب الأعمال", "مكالمة واردة", "رسالة SMS", "تعديل يدوي")
             sources.forEach { src ->
                 val selected = src == activeFilter
                 Box(
@@ -1286,10 +1376,17 @@ fun PermissionsScreen(viewModel: CrmViewModel) {
     val accessGranted by viewModel.accessibilityAccessGranted.collectAsStateWithLifecycle()
     val batteryIgnored by viewModel.batteryOptimizationIgnored.collectAsStateWithLifecycle()
 
+    val waInstalled by viewModel.whatsAppInstalled.collectAsStateWithLifecycle()
+    val w4bInstalled by viewModel.whatsAppBusinessInstalled.collectAsStateWithLifecycle()
+    val waNotifEnabled by viewModel.whatsAppNotifEnabled.collectAsStateWithLifecycle()
+    val w4bNotifEnabled by viewModel.whatsAppBusinessNotifEnabled.collectAsStateWithLifecycle()
+    val waAccessEnabled by viewModel.whatsAppAccessEnabled.collectAsStateWithLifecycle()
+    val w4bAccessEnabled by viewModel.whatsAppBusinessAccessEnabled.collectAsStateWithLifecycle()
+
     // Setup permission launcher
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
+    ) { _ ->
         viewModel.checkAllPermissionStates()
     }
 
@@ -1313,7 +1410,7 @@ fun PermissionsScreen(viewModel: CrmViewModel) {
                     Text(text = "صلاحيات الوصول والتشغيل المتكاملة", fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "يعتمد نظام الحذف الذكي والرصد التلقائي للعملاء بالخلفية على الصلاحيات التالية للوصول وإدارة أرقام الطيف والرسائل.",
+                        text = "تحكم في صلاحيات النظام الأساسية وخصص رصد الإشعارات وإمكانية الوصول لكل من واتساب وواتساب الأعمال بشكل مستقل تماماً.",
                         fontSize = 11.sp,
                         color = Color.Gray,
                         lineHeight = 16.sp
@@ -1334,11 +1431,11 @@ fun PermissionsScreen(viewModel: CrmViewModel) {
             )
         }
 
-        // 2. Notification listener access
+        // 2. Notification listener system bridge
         item {
             PermissionControlCard(
-                title = "رصد إشعارات التطبيقات (Notification Access)",
-                description = "صلاحية إلزامية لرصد إشعارات واتساب وواتساب الأعمال والبيانات الواردة منها وحفظ رقم المرسل غير المحفوظ تلقائياً.",
+                title = "صلاحية النظام لرصد الإشعارات (Notification Access)",
+                description = "الجسر الأساسي في نظام أندرويد الذي يسمح للتطبيق بقراءة الإشعارات الواردة، ثم تطبيق التخصيص المستقل لكل من واتساب وواتساب الأعمال أدناه.",
                 isGranted = notifGranted,
                 onClick = {
                     PermissionManager.openNotificationListenerSettings(context)
@@ -1346,15 +1443,99 @@ fun PermissionsScreen(viewModel: CrmViewModel) {
             )
         }
 
-        // 3. Accessibility Service
+        // 3. Accessibility Service system bridge
         item {
             PermissionControlCard(
                 title = "خدمة إمكانية الوصول الذكية (Accessibility Service)",
-                description = "توقيع مدمج لتعزيز الحفظ التلقائي والتقاط الأرقام من واجهات المحادثات والاتصال النشطة مباشرة من الشاشة.",
+                description = "تعزز التقاط الأرقام مباشرة من شاشات المحادثات وتعمل وفقاً لإعدادات التفعيل المستقلة لكل تطبيق بالأسفل.",
                 isGranted = accessGranted,
                 onClick = {
                     PermissionManager.openAccessibilitySettings(context)
                 }
+            )
+        }
+
+        // Section Header: Per-app independent WhatsApp & WhatsApp Business separation
+        item {
+            Column(modifier = Modifier.padding(top = 4.dp)) {
+                Text(
+                    text = "التخصيص المستقل لتطبيقات واتساب",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "يعمل كل تطبيق بمعزل كامل عن الآخر في الصلاحيات، رصد الإشعارات، والتقاط الواجهة والسجلات.",
+                    fontSize = 11.sp,
+                    color = Color.Gray
+                )
+            }
+        }
+
+        // Independent WhatsApp (com.whatsapp) card
+        item {
+            WhatsAppAppControlCard(
+                title = "واتساب (WhatsApp)",
+                packageId = WhatsAppMonitoringConfig.PKG_WHATSAPP,
+                accentColor = Color(0xFF10B981),
+                icon = Icons.Default.ChatBubble,
+                isInstalled = waInstalled,
+                systemNotifGranted = notifGranted,
+                systemAccessGranted = accessGranted,
+                notifMonitoringEnabled = waNotifEnabled,
+                accessMonitoringEnabled = waAccessEnabled,
+                onToggleNotifMonitoring = { viewModel.toggleWhatsAppNotificationMonitoring() },
+                onToggleAccessMonitoring = { viewModel.toggleWhatsAppAccessibilityMonitoring() },
+                onOpenAppNotifSettings = {
+                    val opened = WhatsAppMonitoringConfig.openAppNotificationSettings(
+                        context,
+                        WhatsAppMonitoringConfig.PKG_WHATSAPP
+                    )
+                    if (!opened) {
+                        Toast.makeText(context, "تعذر فتح إعدادات التطبيق", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                onOpenSystemNotifAccess = {
+                    PermissionManager.openNotificationListenerSettings(context)
+                },
+                cardTestTag = "whatsapp_customization_card",
+                notifSwitchTestTag = "switch_whatsapp_notif",
+                accessSwitchTestTag = "switch_whatsapp_access",
+                appSettingsButtonTestTag = "btn_whatsapp_app_notif_settings"
+            )
+        }
+
+        // Independent WhatsApp Business (com.whatsapp.w4b) card
+        item {
+            WhatsAppAppControlCard(
+                title = "واتساب الأعمال (WhatsApp Business)",
+                packageId = WhatsAppMonitoringConfig.PKG_WHATSAPP_BUSINESS,
+                accentColor = Color(0xFF0284C7),
+                icon = Icons.Default.Storefront,
+                isInstalled = w4bInstalled,
+                systemNotifGranted = notifGranted,
+                systemAccessGranted = accessGranted,
+                notifMonitoringEnabled = w4bNotifEnabled,
+                accessMonitoringEnabled = w4bAccessEnabled,
+                onToggleNotifMonitoring = { viewModel.toggleWhatsAppBusinessNotificationMonitoring() },
+                onToggleAccessMonitoring = { viewModel.toggleWhatsAppBusinessAccessibilityMonitoring() },
+                onOpenAppNotifSettings = {
+                    val opened = WhatsAppMonitoringConfig.openAppNotificationSettings(
+                        context,
+                        WhatsAppMonitoringConfig.PKG_WHATSAPP_BUSINESS
+                    )
+                    if (!opened) {
+                        Toast.makeText(context, "تعذر فتح إعدادات التطبيق", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                onOpenSystemNotifAccess = {
+                    PermissionManager.openNotificationListenerSettings(context)
+                },
+                cardTestTag = "whatsapp_business_customization_card",
+                notifSwitchTestTag = "switch_whatsapp_business_notif",
+                accessSwitchTestTag = "switch_whatsapp_business_access",
+                appSettingsButtonTestTag = "btn_whatsapp_business_app_notif_settings"
             )
         }
 
@@ -1368,6 +1549,223 @@ fun PermissionsScreen(viewModel: CrmViewModel) {
                     PermissionManager.requestIgnoreBatteryOptimization(context)
                 }
             )
+        }
+    }
+}
+
+@Composable
+fun WhatsAppAppControlCard(
+    title: String,
+    packageId: String,
+    accentColor: Color,
+    icon: ImageVector,
+    isInstalled: Boolean,
+    systemNotifGranted: Boolean,
+    systemAccessGranted: Boolean,
+    notifMonitoringEnabled: Boolean,
+    accessMonitoringEnabled: Boolean,
+    onToggleNotifMonitoring: () -> Unit,
+    onToggleAccessMonitoring: () -> Unit,
+    onOpenAppNotifSettings: () -> Unit,
+    onOpenSystemNotifAccess: () -> Unit,
+    cardTestTag: String,
+    notifSwitchTestTag: String,
+    accessSwitchTestTag: String,
+    appSettingsButtonTestTag: String
+) {
+    val activeNotif = systemNotifGranted && notifMonitoringEnabled
+    val activeAccess = systemAccessGranted && accessMonitoringEnabled
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(
+                width = 1.dp,
+                color = accentColor.copy(alpha = 0.28f),
+                shape = RoundedCornerShape(16.dp)
+            )
+            .testTag(cardTestTag)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(accentColor.copy(alpha = 0.14f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(imageVector = icon, contentDescription = null, tint = accentColor, modifier = Modifier.size(20.dp))
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(text = title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text(
+                            text = packageId,
+                            fontSize = 10.sp,
+                            color = Color.Gray,
+                            style = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr)
+                        )
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            if (isInstalled) accentColor.copy(alpha = 0.15f)
+                            else Color.Gray.copy(alpha = 0.15f)
+                        )
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = if (isInstalled) "مثبت" else "غير مثبت",
+                        color = if (isInstalled) accentColor else Color.Gray,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+            Divider(color = Color.Gray.copy(alpha = 0.15f))
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Independent notification monitoring toggle
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .defaultMinSize(minHeight = 48.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(text = "رصد الإشعارات", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = when {
+                                activeNotif -> "• نشط"
+                                !notifMonitoringEnabled -> "• متوقف يدوياً"
+                                else -> "• بانتظار إذن النظام"
+                            },
+                            fontSize = 10.sp,
+                            color = when {
+                                activeNotif -> Color(0xFF10B981)
+                                !notifMonitoringEnabled -> Color.Gray
+                                else -> Color(0xFFF59E0B)
+                            }
+                        )
+                    }
+                    Text(
+                        text = "حفظ الأرقام المجهولة من إشعارات هذا التطبيق فقط.",
+                        fontSize = 10.sp,
+                        color = Color.Gray
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Switch(
+                    checked = notifMonitoringEnabled,
+                    onCheckedChange = { onToggleNotifMonitoring() },
+                    modifier = Modifier.testTag(notifSwitchTestTag)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Independent accessibility capture toggle
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .defaultMinSize(minHeight = 48.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(text = "التقاط الشاشة (Accessibility)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = when {
+                                activeAccess -> "• نشط"
+                                !accessMonitoringEnabled -> "• متوقف يدوياً"
+                                else -> "• بانتظار إذن النظام"
+                            },
+                            fontSize = 10.sp,
+                            color = when {
+                                activeAccess -> Color(0xFF10B981)
+                                !accessMonitoringEnabled -> Color.Gray
+                                else -> Color(0xFFF59E0B)
+                            }
+                        )
+                    }
+                    Text(
+                        text = "استخراج الأرقام عند فتح محادثات هذا التطبيق مباشرة.",
+                        fontSize = 10.sp,
+                        color = Color.Gray
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Switch(
+                    checked = accessMonitoringEnabled,
+                    onCheckedChange = { onToggleAccessMonitoring() },
+                    modifier = Modifier.testTag(accessSwitchTestTag)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onOpenAppNotifSettings,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .defaultMinSize(minHeight = 48.dp)
+                        .testTag(appSettingsButtonTestTag)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.NotificationsActive,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = accentColor
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "إشعارات التطبيق",
+                        fontSize = 12.sp,
+                        color = accentColor
+                    )
+                }
+                if (!systemNotifGranted) {
+                    Button(
+                        onClick = onOpenSystemNotifAccess,
+                        colors = ButtonDefaults.buttonColors(containerColor = accentColor),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .defaultMinSize(minHeight = 48.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Security,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = "منح إذن الرصد", fontSize = 12.sp)
+                    }
+                }
+            }
         }
     }
 }
