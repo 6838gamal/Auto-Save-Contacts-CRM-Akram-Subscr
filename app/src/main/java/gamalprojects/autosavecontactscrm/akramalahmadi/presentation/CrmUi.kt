@@ -17,9 +17,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -377,18 +379,43 @@ fun AppNavigationDrawer(
 
                 // Footer section
                 Divider(modifier = Modifier.padding(horizontal = 16.dp))
+                val effectiveUsedCount = if (isCurrentlySubscribed) {
+                    activeSubscription?.usedContacts ?: totalContacts
+                } else {
+                    freeAccessState.usedContacts
+                }
+                val deletedCount = if (isCurrentlySubscribed) {
+                    activeSubscription?.deletedContacts ?: 0
+                } else {
+                    freeAccessState.deletedContacts
+                }
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(
-                        text = "إجمالي العملاء: $totalContacts",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    if (deletedCount > 0) {
+                        Text(
+                            text = "المحفوظ حالياً: $totalContacts",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "المحسوب فعلياً: $effectiveUsedCount (محذوف: $deletedCount)",
+                            fontSize = 11.sp,
+                            color = Color(0xFFF59E0B)
+                        )
+                    } else {
+                        Text(
+                            text = "إجمالي العملاء: $totalContacts",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = "الإصدار v1.0.0",
@@ -633,6 +660,17 @@ fun DashboardScreen(
                     elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
                     shape = RoundedCornerShape(16.dp)
                 ) {
+                    val dashSubscribed = activeSubscription != null && !activeSubscription!!.isExpired(nowMillis)
+                    val dashEffective = if (dashSubscribed) {
+                        activeSubscription?.usedContacts ?: totalContacts
+                    } else {
+                        freeAccessState.usedContacts
+                    }
+                    val dashDeleted = if (dashSubscribed) {
+                        activeSubscription?.deletedContacts ?: 0
+                    } else {
+                        freeAccessState.deletedContacts
+                    }
                     Column(
                         modifier = Modifier
                             .padding(16.dp)
@@ -652,6 +690,15 @@ fun DashboardScreen(
                         Text(text = stringResource(R.string.stat_saved_contacts), fontSize = 12.sp, color = Color.Gray)
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(text = "$totalContacts", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                        if (dashDeleted > 0) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "محسوب فعلياً: $dashEffective • محذوف: $dashDeleted",
+                                fontSize = 10.sp,
+                                color = Color(0xFFF59E0B),
+                                textAlign = TextAlign.Center
+                            )
+                        }
                     }
                 }
 
@@ -985,10 +1032,10 @@ fun ContactItemCard(
                         .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        val icon = when (contact.source) {
-                            "مكالمة واردة", "مكالمة صادرة" -> Icons.Default.Phone
-                            "رسالة SMS" -> Icons.Default.Sms
-                            "واتساب" -> Icons.Default.ChatBubble
+                        val icon = when {
+                            contact.source.contains("مكالمة") -> Icons.Default.Phone
+                            contact.source == "رسالة SMS" -> Icons.Default.Sms
+                            contact.source.contains("واتساب") -> Icons.Default.ChatBubble
                             else -> Icons.Default.SettingsAccessibility
                         }
                         Icon(imageVector = icon, contentDescription = null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(12.dp))
@@ -1036,6 +1083,7 @@ fun LogsScreen(viewModel: CrmViewModel) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
                 .padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -1049,6 +1097,7 @@ fun LogsScreen(viewModel: CrmViewModel) {
                         .clickable { viewModel.setLogFilterSource(src) }
                         .padding(horizontal = 14.dp, vertical = 6.dp)
                         .border(1.dp, if (selected) Color.Transparent else Color.Gray.copy(alpha = 0.3f), RoundedCornerShape(20.dp))
+                        .testTag("logs_filter_$src")
                 ) {
                     Text(
                         text = src,
@@ -1289,7 +1338,7 @@ fun PermissionsScreen(viewModel: CrmViewModel) {
         item {
             PermissionControlCard(
                 title = "رصد إشعارات التطبيقات (Notification Access)",
-                description = "صلاحية إلزامية لرصد إشعارات com.whatsapp والبيانات الواردة منها وحفظ رقم مرسل الواتساب غير المحفوظ تلقائياً.",
+                description = "صلاحية إلزامية لرصد إشعارات واتساب وواتساب الأعمال والبيانات الواردة منها وحفظ رقم المرسل غير المحفوظ تلقائياً.",
                 isGranted = notifGranted,
                 onClick = {
                     PermissionManager.openNotificationListenerSettings(context)

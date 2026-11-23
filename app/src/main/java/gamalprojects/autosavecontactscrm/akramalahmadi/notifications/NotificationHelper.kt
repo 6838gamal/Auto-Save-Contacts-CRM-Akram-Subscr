@@ -28,6 +28,7 @@ object NotificationHelper {
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "يعرض حالة خدمة رصد المكالمات والرسائل بالخلفية"
+                setShowBadge(false)
             }
             notificationManager.createNotificationChannel(serviceChannel)
 
@@ -44,8 +45,9 @@ object NotificationHelper {
     }
 
     fun showNotification(context: Context, title: String, message: String) {
+        createNotificationChannels(context)
         val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
             context,
@@ -72,22 +74,31 @@ object NotificationHelper {
         statusText: String
     ): Notification {
         val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
             context,
-            0,
+            102,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(context, CHANNEL_FOREGROUND_SERVICE)
+        val notification = NotificationCompat.Builder(context, CHANNEL_FOREGROUND_SERVICE)
             .setSmallIcon(android.R.drawable.presence_online)
             .setContentTitle("AutoSave Contacts CRM نشط")
             .setContentText("الحالة: $statusText | العملاء المحفوظون: $savedCount")
             .setOngoing(true)
+            .setAutoCancel(false)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(pendingIntent)
             .setCategory(Notification.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+
+        notification.flags = notification.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
+        return notification
     }
 }

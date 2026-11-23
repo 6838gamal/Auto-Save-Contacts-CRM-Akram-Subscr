@@ -245,6 +245,8 @@ data class SubscriptionConnectRequest(
     @Json(name = "os_version") val osVersion: String,
     @Json(name = "network_type") val networkType: String,
     @Json(name = "saved_contacts_count") val savedContactsCount: Int = 0,
+    @Json(name = "currently_saved_count") val currentlySavedCount: Int = 0,
+    @Json(name = "deleted_contacts_count") val deletedContactsCount: Int = 0,
     @Json(name = "free_contacts_used") val freeContactsUsed: Int = 0,
     @Json(name = "free_contacts_limit") val freeContactsLimit: Int = 100,
     @Json(name = "free_tier_exhausted") val freeTierExhausted: Boolean = false,
@@ -280,7 +282,8 @@ data class SubscriptionVerifyRequest(
     @Json(name = "local_ip") val localIp: String,
     @Json(name = "device_model") val deviceModel: String,
     @Json(name = "saved_contacts_count") val savedContactsCount: Int = 0,
-    @Json(name = "used_quota_count") val usedQuotaCount: Int = 0
+    @Json(name = "used_quota_count") val usedQuotaCount: Int = 0,
+    @Json(name = "deleted_contacts_count") val deletedContactsCount: Int = 0
 )
 
 @JsonClass(generateAdapter = true)
@@ -291,6 +294,7 @@ data class SubscriptionUsageRequest(
     @Json(name = "public_ip") val publicIp: String,
     @Json(name = "used_contacts") val usedContacts: Int,
     @Json(name = "total_contacts") val totalContacts: Int,
+    @Json(name = "deleted_contacts_count") val deletedContactsCount: Int = 0,
     @Json(name = "plan_type") val planType: String = "SUBSCRIBED"
 )
 
@@ -352,6 +356,7 @@ data class SubscriptionApiResponse(
     @Json(name = "is_lifetime") val isLifetime: Boolean = false,
     @Json(name = "max_contacts") val maxContacts: Int? = null,
     @Json(name = "used_contacts") val usedContacts: Int = 0,
+    @Json(name = "deleted_contacts_count") val deletedContactsCount: Int = 0,
     @Json(name = "free_contacts_used") val freeContactsUsed: Int = 0,
     @Json(name = "free_contacts_limit") val freeContactsLimit: Int? = null,
     @Json(name = "free_tier_exhausted") val freeTierExhausted: Boolean = false,

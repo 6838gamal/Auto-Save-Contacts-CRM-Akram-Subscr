@@ -33,7 +33,7 @@ interface ContactDao {
     suspend fun updateContact(contact: Contact)
 
     @Delete
-    suspend fun deleteContact(contact: Contact)
+    suspend fun deleteContact(contact: Contact): Int
 
     @Query("DELETE FROM contacts_table")
     suspend fun deleteAllContacts()

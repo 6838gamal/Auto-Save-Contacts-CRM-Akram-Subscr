@@ -56,7 +56,7 @@
     <string name="msg_edit_contact_title">تعديل اسم العميل</string>
     <string name="msg_edit_contact_name_label">اسم العميل الجديد:</string>
     <string name="msg_delete_confirm_title">حذف عميل</string>
-    <string name="msg_delete_confirm_desc">هل أنت متأكد من رغبتك في حذف هذا العميل من سجلات الـ CRM؟ لن يؤيد حذفه من الهاتف تلقائياً.</string>
+    <string name="msg_delete_confirm_desc">هل أنت متأكد من رغبتك في حذف هذا العميل؟ تنبيه: يبقى الرقم محسوباً ضمن عدد الاستخدام الفعلي لباقتك حتى بعد حذفه أو تصديره، ولن يُحذف من الهاتف تلقائياً.</string>
     <string name="msg_perm_prompt_title">الصلاحيات متطلبة</string>
     <string name="msg_perm_prompt_desc">من فضلك قم بمنح جميع الصلاحيات اللازمة لضمان تشغيل خدمات الرصد التلقائي ومزامنة قاعدة البيانات إلى قائمة جهات الاتصال بالهاتف.</string>
     

@@ -23,18 +23,31 @@ class NotificationListenerServiceImpl : NotificationListenerService() {
         val db = AppDatabase.getDatabase(this)
         repo = ContactsRepository(db)
         Log.d("NotificationListener", "Notification Listener Service Created")
+        AutoSaveForegroundService.startIfEnabled(applicationContext)
+    }
+
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        Log.d("NotificationListener", "Notification Listener Connected")
+        AutoSaveForegroundService.startIfEnabled(applicationContext)
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val packageName = sbn.packageName ?: return
         
-        // WhatsApp notification processing
-        if (packageName == "com.whatsapp") {
+        val sourceLabel = when (packageName) {
+            "com.whatsapp" -> "واتساب"
+            "com.whatsapp.w4b" -> "واتساب الأعمال"
+            else -> null
+        }
+
+        // WhatsApp & WhatsApp Business notification processing
+        if (sourceLabel != null) {
             val extras = sbn.notification.extras ?: return
-            val title = extras.getString(Notification.EXTRA_TITLE) ?: ""
+            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
             val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
 
-            Log.i("NotificationListener", "WhatsApp Notification Posted: Title: $title, Text: $text")
+            Log.i("NotificationListener", "$sourceLabel Notification Posted: Title: $title, Text: $text")
 
             val potentialPhone = extractPhoneNumber(title)
             if (potentialPhone != null) {
@@ -46,18 +59,18 @@ class NotificationListenerServiceImpl : NotificationListenerService() {
                     if (recentlyProcessed.size > 500) {
                         recentlyProcessed.entries.removeIf { (now - it.value) > 120_000L }
                     }
-                    Log.d("NotificationListener", "Found WhatsApp phone number to parse: $potentialPhone")
+                    Log.d("NotificationListener", "Found $sourceLabel phone number to parse: $potentialPhone")
                     scope.launch {
                         repo.processNewConnection(
                             applicationContext,
                             potentialPhone,
-                            "واتساب",
-                            "رسالة واتساب: ${text.take(60)}"
+                            sourceLabel,
+                            "رسالة $sourceLabel: ${text.take(60)}"
                         )
                     }
                 }
             } else {
-                Log.d("NotificationListener", "WhatsApp Notification Title contains letters or short, ignoring (probably saved contact): $title")
+                Log.d("NotificationListener", "$sourceLabel Notification Title contains letters or short, ignoring (probably saved contact): $title")
             }
         }
     }
@@ -76,15 +89,15 @@ class NotificationListenerServiceImpl : NotificationListenerService() {
 
         // If it contains Arabic alphabets or English letters, WhatsApp is showing a saved contact name.
         // Unsaved numbers are shown purely as "+967 777 777 777" or "777 777 777".
-        val hasLetters = trimmed.any { c -> 
+        val hasLetters = trimmed.any { c ->
             c.isLetter() || (c.code in 0x0600..0x06FF) // Arabic characters block range
         }
         if (hasLetters) {
             return null
         }
 
-        // Clean up formatting spaces, hyphens, and brackets.
-        val cleaned = trimmed.replace(Regex("[^0-9+]"), "")
+        // Convert Arabic-Indic numerals and strip directional/formatting characters
+        val cleaned = PhoneNumberUtils.cleanNumber(trimmed)
         if (cleaned.length >= 7) {
             return cleaned
         }

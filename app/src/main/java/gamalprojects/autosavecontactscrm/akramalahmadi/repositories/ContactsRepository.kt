@@ -208,16 +208,21 @@ class ContactsRepository(private val db: AppDatabase) {
     }
 
     suspend fun deleteContact(context: Context, contact: Contact) = withContext(Dispatchers.IO) {
-        contactDao.deleteContact(contact)
-        logEntryDao.insertLog(
-            LogEntry(
-                phone = contact.originalPhone,
-                source = "حذف يدوي",
-                status = "حذف العميل",
-                details = "تم حذف ${contact.name} من سجلات الـ CRM"
+        val deletedRows = saveMutex.withLock {
+            contactDao.deleteContact(contact)
+        }
+        if (deletedRows > 0) {
+            logEntryDao.insertLog(
+                LogEntry(
+                    phone = contact.originalPhone,
+                    source = "حذف يدوي",
+                    status = "حذف العميل",
+                    details = "تم حذف ${contact.name} من سجلات التطبيق (يبقى محسوباً ضمن حد الخطة)"
+                )
             )
-        )
-        subscriptionRepo.syncSingleClientToDatabase(context, contact, isDeleted = true)
+            subscriptionRepo.recordContactDeleted(context)
+            subscriptionRepo.syncSingleClientToDatabase(context, contact, isDeleted = true)
+        }
     }
 
     suspend fun clearLogs() = withContext(Dispatchers.IO) {

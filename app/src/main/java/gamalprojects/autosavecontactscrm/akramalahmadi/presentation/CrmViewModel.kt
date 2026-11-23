@@ -47,11 +47,7 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
 
     // Logs Flow
     val logs: StateFlow<List<LogEntry>> = combine(repo.allLogs, _logFilterSource) { list, filter ->
-        if (filter == "الكل") {
-            list
-        } else {
-            list.filter { it.source == filter }
-        }
+        list.filter { matchesLogFilter(it, filter) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // Dashboard core variables
@@ -132,14 +128,20 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun checkAllPermissionStates() {
         val context = getApplication<Application>()
-        _permissionsGranted.value = PermissionManager.hasAllRuntimePermissions(context)
+        val allPerms = PermissionManager.hasAllRuntimePermissions(context)
+        val hasNotifPerm = PermissionManager.hasNotificationPermission(context)
+        _permissionsGranted.value = allPerms
         _notificationAccessGranted.value = PermissionManager.isNotificationListenerEnabled(context)
         _accessibilityAccessGranted.value = PermissionManager.isAccessibilityServiceEnabled(context)
         _batteryOptimizationIgnored.value = PermissionManager.isIgnoringBatteryOptimization(context)
-        
-        // Auto update service running state in ViewModel
-        // WorkManager or simple boolean can verify if service started
-        _isServiceRunning.value = PermissionManager.hasAllRuntimePermissions(context)
+
+        val userPaused = isMonitoringManuallyPaused(context)
+        val inUnlockedApp = _currentScreen.value != Screen.SPLASH && _currentScreen.value != Screen.SUBSCRIPTION_GATE
+        if (inUnlockedApp && !userPaused && (hasNotifPerm || allPerms) && !AutoSaveForegroundService.isRunning) {
+            AutoSaveForegroundService.start(context)
+        }
+        _isServiceRunning.value = AutoSaveForegroundService.isRunning ||
+            (!userPaused && AutoSaveForegroundService.isMonitoringEnabled(context) && (hasNotifPerm || allPerms))
     }
 
     /**
@@ -148,9 +150,11 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleService() {
         val context = getApplication<Application>()
         if (_isServiceRunning.value) {
+            setMonitoringManuallyPaused(context, true)
             AutoSaveForegroundService.stop(context)
             _isServiceRunning.value = false
         } else {
+            setMonitoringManuallyPaused(context, false)
             AutoSaveForegroundService.start(context)
             _isServiceRunning.value = true
         }
@@ -158,10 +162,26 @@ class CrmViewModel(application: Application) : AndroidViewModel(application) {
 
     fun tryStartMonitoringAutomatically() {
         val context = getApplication<Application>()
-        if (PermissionManager.hasAllRuntimePermissions(context)) {
+        if (!isMonitoringManuallyPaused(context) &&
+            (PermissionManager.hasNotificationPermission(context) || PermissionManager.hasAllRuntimePermissions(context))
+        ) {
             AutoSaveForegroundService.start(context)
             _isServiceRunning.value = true
         }
+    }
+
+    private fun isMonitoringManuallyPaused(context: Context): Boolean {
+        return context.applicationContext
+            .getSharedPreferences("service_monitoring_prefs", Context.MODE_PRIVATE)
+            .getBoolean("user_manually_paused", false)
+    }
+
+    private fun setMonitoringManuallyPaused(context: Context, paused: Boolean) {
+        context.applicationContext
+            .getSharedPreferences("service_monitoring_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("user_manually_paused", paused)
+            .apply()
     }
 
     fun toggleTheme() {
@@ -334,4 +354,19 @@ enum class Screen {
     EXPORT,
     PERMISSIONS,
     SETTINGS
+}
+
+internal fun matchesLogFilter(log: LogEntry, filter: String): Boolean {
+    if (filter == "الكل") return true
+    val src = log.source.trim()
+    return when (filter) {
+        "واتساب" -> src == "واتساب" ||
+            src == "واتساب الأعمال" ||
+            src.contains("واتساب", ignoreCase = true) ||
+            src.contains("whatsapp", ignoreCase = true) ||
+            src == "خدمة إمكانية الوصول"
+        "مكالمة واردة" -> src == "مكالمة واردة" || src == "مكالمة صادرة" || src.contains("مكالمة")
+        "تعديل يدوي" -> src == "تعديل يدوي" || src == "حذف يدوي"
+        else -> src == filter
+    }
 }

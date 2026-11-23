@@ -8,9 +8,16 @@ import gamalprojects.autosavecontactscrm.akramalahmadi.services.AutoSaveForegrou
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            Log.i("BootReceiver", "Device boot completed. Re-triggering CRM monitoring foreground service.")
-            AutoSaveForegroundService.start(context)
+        val action = intent.action ?: return
+        if (action == Intent.ACTION_BOOT_COMPLETED ||
+            action == Intent.ACTION_MY_PACKAGE_REPLACED ||
+            action == "android.intent.action.QUICKBOOT_POWERON"
+        ) {
+            if (AutoSaveForegroundService.isMonitoringEnabled(context)) {
+                Log.i("BootReceiver", "System event $action. Re-triggering CRM monitoring foreground service.")
+                AutoSaveForegroundService.startIfEnabled(context)
+            }
         }
     }
 }
+

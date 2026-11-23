@@ -77,6 +77,8 @@ data class ActiveSubscriptionInfo(
     val isTrial: Boolean,
     val maxContacts: Int?,
     val usedContacts: Int,
+    val currentlySavedContacts: Int = 0,
+    val deletedContacts: Int = 0,
     val activatedAt: Long,
     val expiresAt: Long?,
     val boundUserId: String,
@@ -110,6 +112,8 @@ data class ActiveSubscriptionInfo(
 
 data class FreeAccessState(
     val usedContacts: Int = 0,
+    val currentlySavedContacts: Int = 0,
+    val deletedContacts: Int = 0,
     val limit: Int = SubscriptionRepository.FREE_CONTACTS_LIMIT,
     val isExhausted: Boolean = false
 ) {
@@ -142,6 +146,9 @@ class SubscriptionRepository(
         private const val KEY_LOCK_REASON = "subscription_lock_reason"
         private const val KEY_SUBSCRIPTION_LOCKED = "subscription_explicitly_locked"
         private const val KEY_FREE_USED = "free_contacts_used"
+        private const val KEY_FREE_DELETED = "free_contacts_deleted"
+        private const val KEY_SUB_DELETED = "sub_contacts_deleted"
+        private const val KEY_TOTAL_DELETED = "total_contacts_deleted"
         private const val KEY_FREE_EXHAUSTED = "free_tier_exhausted"
         private const val KEY_FREE_WARNING_TIER = "free_tier_warning_milestone"
         private const val KEY_PENDING_DELETED_CLIENTS = "pending_deleted_clients_json"
@@ -182,7 +189,11 @@ class SubscriptionRepository(
             if (activeCode.isBlank()) {
                 flowOf(null)
             } else {
-                codeDao.observeCode(activeCode).map { entity ->
+                combine(
+                    codeDao.observeCode(activeCode),
+                    contactDao.getContactsCount(),
+                    settingDao.getSettingFlow(KEY_SUB_DELETED)
+                ) { entity, dbCount, subDeletedSetting ->
                     val now = System.currentTimeMillis()
                     if (entity == null || !entity.isSubscribed || !entity.isActive) {
                         null
@@ -191,7 +202,11 @@ class SubscriptionRepository(
                     } else if (entity.maxContacts != null && entity.maxContacts > 0 && entity.usedContacts >= entity.maxContacts) {
                         null
                     } else {
-                        entity.toActiveInfo()
+                        val storedSubDeleted = subDeletedSetting?.value?.toIntOrNull() ?: 0
+                        entity.toActiveInfo(
+                            currentlySaved = dbCount,
+                            storedSubDeleted = storedSubDeleted
+                        )
                     }
                 }
             }
@@ -202,13 +217,18 @@ class SubscriptionRepository(
         return combine(
             settingDao.getSettingFlow(KEY_FREE_USED),
             settingDao.getSettingFlow(KEY_FREE_EXHAUSTED),
+            settingDao.getSettingFlow(KEY_FREE_DELETED),
             contactDao.getContactsCount()
-        ) { usedSetting, exhaustedSetting, dbCount ->
+        ) { usedSetting, exhaustedSetting, deletedSetting, dbCount ->
             val storedUsed = usedSetting?.value?.toIntOrNull() ?: 0
-            val effectiveUsed = maxOf(storedUsed, dbCount)
+            val storedDeleted = deletedSetting?.value?.toIntOrNull() ?: 0
+            val effectiveUsed = maxOf(storedUsed, dbCount + storedDeleted)
+            val effectiveDeleted = maxOf(storedDeleted, (effectiveUsed - dbCount).coerceAtLeast(0))
             val exhausted = (exhaustedSetting?.value == "1") || (effectiveUsed >= FREE_CONTACTS_LIMIT)
             FreeAccessState(
                 usedContacts = effectiveUsed,
+                currentlySavedContacts = dbCount,
+                deletedContacts = effectiveDeleted,
                 limit = FREE_CONTACTS_LIMIT,
                 isExhausted = exhausted
             )
@@ -220,17 +240,32 @@ class SubscriptionRepository(
     }
 
     suspend fun getFreeAccessStateSync(): FreeAccessState = withContext(Dispatchers.IO) {
+        val activeCode = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim().orEmpty()
         val storedUsed = settingDao.getSetting(KEY_FREE_USED)?.value?.toIntOrNull() ?: 0
+        val storedDeleted = settingDao.getSetting(KEY_FREE_DELETED)?.value?.toIntOrNull() ?: 0
         val dbCount = contactDao.getContactsCountSync()
-        val effectiveUsed = maxOf(storedUsed, dbCount)
+        val effectiveUsed = if (activeCode.isBlank()) {
+            maxOf(storedUsed, dbCount + storedDeleted)
+        } else {
+            storedUsed
+        }
+        val effectiveDeleted = if (activeCode.isBlank()) {
+            maxOf(storedDeleted, (effectiveUsed - dbCount).coerceAtLeast(0))
+        } else {
+            storedDeleted
+        }
         val exhaustedFlag = settingDao.getSetting(KEY_FREE_EXHAUSTED)?.value == "1"
         val exhausted = exhaustedFlag || effectiveUsed >= FREE_CONTACTS_LIMIT
-        if (exhausted && !exhaustedFlag) {
+        if (activeCode.isBlank() && effectiveUsed > storedUsed) {
             settingDao.insertSetting(SettingEntity(KEY_FREE_USED, effectiveUsed.toString()))
+        }
+        if (exhausted && !exhaustedFlag) {
             settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
         }
         FreeAccessState(
             usedContacts = effectiveUsed,
+            currentlySavedContacts = dbCount,
+            deletedContacts = effectiveDeleted,
             limit = FREE_CONTACTS_LIMIT,
             isExhausted = exhausted
         )
@@ -299,8 +334,10 @@ class SubscriptionRepository(
             if (cached.isActive && cached.isSubscribed &&
                 (cached.boundUserId.isNullOrBlank() || cached.boundUserId == snapshot.userId)
             ) {
+                val subDeleted = settingDao.getSetting(KEY_SUB_DELETED)?.value?.toIntOrNull() ?: 0
+                val dbCount = contactDao.getContactsCountSync()
                 return@withContext LocalAccessDecision(
-                    activeInfo = cached.toActiveInfo(snapshot),
+                    activeInfo = cached.toActiveInfo(snapshot, currentlySaved = dbCount, storedSubDeleted = subDeleted),
                     freeAccessState = freeState,
                     isAllowed = true,
                     errorMessage = null
@@ -420,8 +457,9 @@ class SubscriptionRepository(
             effectiveCached.expiresAt != null && now < effectiveCached.expiresAt &&
             (effectiveCached.boundUserId.isNullOrBlank() || effectiveCached.boundUserId == snapshot.userId)
         ) {
+            val subDeleted = settingDao.getSetting(KEY_SUB_DELETED)?.value?.toIntOrNull() ?: 0
             return@withContext SessionVerifyOutcome(
-                activeInfo = effectiveCached.toActiveInfo(snapshot),
+                activeInfo = effectiveCached.toActiveInfo(snapshot, currentlySaved = totalContacts, storedSubDeleted = subDeleted),
                 freeAccessState = freeState,
                 isAllowed = true,
                 dbStatus = notConfiguredStatus,
@@ -483,6 +521,8 @@ class SubscriptionRepository(
                         osVersion = snapshot.osVersion,
                         networkType = snapshot.networkType,
                         savedContactsCount = totalContacts,
+                        currentlySavedCount = totalContacts,
+                        deletedContactsCount = freeState.deletedContacts,
                         freeContactsUsed = freeState.usedContacts,
                         freeContactsLimit = freeState.limit,
                         freeTierExhausted = freeState.isExhausted,
@@ -500,26 +540,51 @@ class SubscriptionRepository(
             val connectSucceeded = connectResp?.isSuccessful == true
             val connectBody = if (connectSucceeded) connectResp?.body() else null
 
-            // Reconcile server-stored free usage if the server recognizes this immutable device after reinstall
+            // Reconcile server-stored free usage & deletions if server recognizes this immutable device
             val serverFreeUsed = connectBody?.freeContactsUsed ?: 0
-            val reconciledUsed = maxOf(freeState.usedContacts, serverFreeUsed)
-            val reconciledExhausted = freeState.isExhausted ||
-                (connectBody?.freeTierExhausted == true) ||
-                reconciledUsed >= FREE_CONTACTS_LIMIT
+            val serverDeleted = connectBody?.deletedContactsCount ?: 0
+            val effectiveFreeState = if (activeCodeKey.isNullOrBlank()) {
+                val reconciledDeleted = maxOf(freeState.deletedContacts, serverDeleted)
+                val reconciledUsed = maxOf(freeState.usedContacts, serverFreeUsed, totalContacts + reconciledDeleted)
+                val finalDeleted = maxOf(reconciledDeleted, (reconciledUsed - totalContacts).coerceAtLeast(0))
+                val reconciledExhausted = freeState.isExhausted ||
+                    (connectBody?.freeTierExhausted == true) ||
+                    reconciledUsed >= FREE_CONTACTS_LIMIT
 
-            if (reconciledUsed > freeState.usedContacts) {
-                settingDao.insertSetting(SettingEntity(KEY_FREE_USED, reconciledUsed.toString()))
-            }
-            if (reconciledExhausted && !freeState.isExhausted) {
-                settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
-                settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, MSG_FREE_LIMIT_REACHED))
-            }
+                if (reconciledUsed > freeState.usedContacts) {
+                    settingDao.insertSetting(SettingEntity(KEY_FREE_USED, reconciledUsed.toString()))
+                }
+                if (finalDeleted > freeState.deletedContacts) {
+                    settingDao.insertSetting(SettingEntity(KEY_FREE_DELETED, finalDeleted.toString()))
+                }
+                if (reconciledExhausted && !freeState.isExhausted) {
+                    settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
+                    settingDao.insertSetting(SettingEntity(KEY_LOCK_REASON, MSG_FREE_LIMIT_REACHED))
+                }
 
-            val effectiveFreeState = FreeAccessState(
-                usedContacts = reconciledUsed,
-                limit = FREE_CONTACTS_LIMIT,
-                isExhausted = reconciledExhausted
-            )
+                FreeAccessState(
+                    usedContacts = reconciledUsed,
+                    currentlySavedContacts = totalContacts,
+                    deletedContacts = finalDeleted,
+                    limit = FREE_CONTACTS_LIMIT,
+                    isExhausted = reconciledExhausted
+                )
+            } else {
+                val reconciledUsed = maxOf(freeState.usedContacts, serverFreeUsed)
+                val reconciledExhausted = freeState.isExhausted ||
+                    (connectBody?.freeTierExhausted == true) ||
+                    reconciledUsed >= FREE_CONTACTS_LIMIT
+                if (reconciledUsed > freeState.usedContacts) {
+                    settingDao.insertSetting(SettingEntity(KEY_FREE_USED, reconciledUsed.toString()))
+                }
+                if (reconciledExhausted && !freeState.isExhausted) {
+                    settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
+                }
+                freeState.copy(
+                    usedContacts = reconciledUsed,
+                    isExhausted = reconciledExhausted
+                )
+            }
 
             if (connectSucceeded) {
                 settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "0"))
@@ -529,7 +594,7 @@ class SubscriptionRepository(
 
             if (activeCodeKey.isNullOrBlank()) {
                 if (!connectSucceeded) {
-                    return offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked)
+                    return offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked, subDeleted = 0)
                 }
 
                 val dbStatus = DbConnectionStatus.Connected("متصل")
@@ -549,6 +614,7 @@ class SubscriptionRepository(
                 return SessionVerifyOutcome(null, effectiveFreeState, false, dbStatus, reason, false)
             }
 
+            val subDeletedCount = settingDao.getSetting(KEY_SUB_DELETED)?.value?.toIntOrNull() ?: 0
             val response = api.verifySession(
                 authorization = authHeader,
                 apiKey = apiKeyHeader,
@@ -561,7 +627,8 @@ class SubscriptionRepository(
                     localIp = snapshot.localIp,
                     deviceModel = snapshot.deviceModel,
                     savedContactsCount = totalContacts,
-                    usedQuotaCount = cachedUsedQuota
+                    usedQuotaCount = cachedUsedQuota,
+                    deletedContactsCount = subDeletedCount
                 )
             )
 
@@ -602,14 +669,15 @@ class SubscriptionRepository(
                         SessionVerifyOutcome(null, effectiveFreeState, false, DbConnectionStatus.Connected("متصل"), serverErr, false)
                     }
                 } else {
-                    offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked)
+                    offlineFallbackOutcome(snapshot, effectiveFreeState, activeCodeKey, cachedCode, explicitlyLocked, subDeleted = subDeletedCount)
                 }
             }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
             settingDao.insertSetting(SettingEntity(KEY_PENDING_TELEMETRY_SYNC, "1"))
-            offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked)
+            val cachedSubDeleted = settingDao.getSetting(KEY_SUB_DELETED)?.value?.toIntOrNull() ?: 0
+            offlineFallbackOutcome(snapshot, freeState, activeCodeKey, cachedCode, explicitlyLocked, subDeleted = cachedSubDeleted)
         }
     }
 
@@ -618,7 +686,8 @@ class SubscriptionRepository(
         freeState: FreeAccessState,
         activeCodeKey: String?,
         cachedCode: SubscriptionCodeEntity?,
-        explicitlyLocked: Boolean
+        explicitlyLocked: Boolean,
+        subDeleted: Int = 0
     ): SessionVerifyOutcome {
         val offlineStatus = DbConnectionStatus.Disconnected(MSG_CONTACT_OWNER_OFFLINE)
         val now = System.currentTimeMillis()
@@ -634,7 +703,7 @@ class SubscriptionRepository(
         }
         if (validCached != null) {
             return SessionVerifyOutcome(
-                activeInfo = validCached.toActiveInfo(snapshot),
+                activeInfo = validCached.toActiveInfo(snapshot, currentlySaved = freeState.currentlySavedContacts, storedSubDeleted = subDeleted),
                 freeAccessState = freeState,
                 isAllowed = true,
                 dbStatus = offlineStatus,
@@ -678,6 +747,8 @@ class SubscriptionRepository(
                     osVersion = snapshot.osVersion,
                     networkType = snapshot.networkType,
                     savedContactsCount = totalContacts,
+                    currentlySavedCount = totalContacts,
+                    deletedContactsCount = freeState.deletedContacts,
                     freeContactsUsed = freeState.usedContacts,
                     freeContactsLimit = freeState.limit,
                     freeTierExhausted = freeState.isExhausted,
@@ -867,8 +938,10 @@ class SubscriptionRepository(
         val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
         if (activeCodeKey.isNullOrBlank()) {
             val storedUsed = settingDao.getSetting(KEY_FREE_USED)?.value?.toIntOrNull() ?: 0
+            val storedDeleted = settingDao.getSetting(KEY_FREE_DELETED)?.value?.toIntOrNull() ?: 0
             val dbCount = contactDao.getContactsCountSync()
-            val nextFreeUsed = maxOf(storedUsed + 1, dbCount)
+            val nextFreeUsed = maxOf(storedUsed + 1, dbCount + storedDeleted)
+            val effectiveDeleted = maxOf(storedDeleted, (nextFreeUsed - dbCount).coerceAtLeast(0))
             val isExhausted = nextFreeUsed >= FREE_CONTACTS_LIMIT
             settingDao.insertSetting(SettingEntity(KEY_FREE_USED, nextFreeUsed.toString()))
 
@@ -879,6 +952,8 @@ class SubscriptionRepository(
 
             val updatedFreeState = FreeAccessState(
                 usedContacts = nextFreeUsed,
+                currentlySavedContacts = dbCount,
+                deletedContacts = effectiveDeleted,
                 limit = FREE_CONTACTS_LIMIT,
                 isExhausted = isExhausted
             )
@@ -948,6 +1023,57 @@ class SubscriptionRepository(
         true
     }
 
+    /**
+     * Tracks contact deletions transparently without ever refunding cumulative plan quota,
+     * preventing export-and-delete bypass while clearly showing saved vs deleted counts.
+     */
+    suspend fun recordContactDeleted(context: Context) = withContext(Dispatchers.IO) {
+        val totalDeleted = (settingDao.getSetting(KEY_TOTAL_DELETED)?.value?.toIntOrNull() ?: 0) + 1
+        settingDao.insertSetting(SettingEntity(KEY_TOTAL_DELETED, totalDeleted.toString()))
+
+        val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
+        val activeEntity = activeCodeKey?.takeIf { it.isNotBlank() }?.let { codeDao.getCode(it) }
+        val now = System.currentTimeMillis()
+        val hasValidSub = activeEntity != null &&
+            activeEntity.isSubscribed &&
+            activeEntity.isActive &&
+            activeEntity.expiresAt != null &&
+            now < activeEntity.expiresAt
+
+        if (hasValidSub) {
+            val nextSubDeleted = (settingDao.getSetting(KEY_SUB_DELETED)?.value?.toIntOrNull() ?: 0) + 1
+            settingDao.insertSetting(SettingEntity(KEY_SUB_DELETED, nextSubDeleted.toString()))
+            syncUsageToBackend(context, activeEntity!!.code, activeEntity.usedContacts)
+        } else {
+            val dbCount = contactDao.getContactsCountSync()
+            val storedUsed = settingDao.getSetting(KEY_FREE_USED)?.value?.toIntOrNull() ?: 0
+            val nextFreeDeleted = (settingDao.getSetting(KEY_FREE_DELETED)?.value?.toIntOrNull() ?: 0) + 1
+            settingDao.insertSetting(SettingEntity(KEY_FREE_DELETED, nextFreeDeleted.toString()))
+
+            val reconciledUsed = maxOf(storedUsed, dbCount + nextFreeDeleted)
+            if (reconciledUsed > storedUsed) {
+                settingDao.insertSetting(SettingEntity(KEY_FREE_USED, reconciledUsed.toString()))
+            }
+            val effectiveDeleted = maxOf(nextFreeDeleted, (reconciledUsed - dbCount).coerceAtLeast(0))
+            val isExhausted = reconciledUsed >= FREE_CONTACTS_LIMIT ||
+                settingDao.getSetting(KEY_FREE_EXHAUSTED)?.value == "1"
+            if (isExhausted) {
+                settingDao.insertSetting(SettingEntity(KEY_FREE_EXHAUSTED, "1"))
+            }
+
+            syncFreeUsageToBackend(
+                context,
+                FreeAccessState(
+                    usedContacts = reconciledUsed,
+                    currentlySavedContacts = dbCount,
+                    deletedContacts = effectiveDeleted,
+                    limit = FREE_CONTACTS_LIMIT,
+                    isExhausted = isExhausted
+                )
+            )
+        }
+    }
+
     private suspend fun resolveCurrentPlanType(): String {
         val activeCodeKey = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
         if (!activeCodeKey.isNullOrBlank()) {
@@ -985,6 +1111,8 @@ class SubscriptionRepository(
                     osVersion = snapshot.osVersion,
                     networkType = snapshot.networkType,
                     savedContactsCount = totalContacts,
+                    currentlySavedCount = freeState.currentlySavedContacts,
+                    deletedContactsCount = freeState.deletedContacts,
                     freeContactsUsed = freeState.usedContacts,
                     freeContactsLimit = freeState.limit,
                     freeTierExhausted = freeState.isExhausted,
@@ -1010,6 +1138,7 @@ class SubscriptionRepository(
         }
         val snapshot = UserIdentityManager.getCachedSnapshot(context)
         val totalContacts = contactDao.getContactsCountSync()
+        val subDeleted = settingDao.getSetting(KEY_SUB_DELETED)?.value?.toIntOrNull() ?: 0
         val (authHeader, apiKeyHeader) = resolveAuthHeaders()
         try {
             val resp = api.reportUsage(
@@ -1022,6 +1151,7 @@ class SubscriptionRepository(
                     publicIp = snapshot.publicIp,
                     usedContacts = usedCount,
                     totalContacts = totalContacts,
+                    deletedContactsCount = subDeleted,
                     planType = "SUBSCRIBED"
                 )
             )
@@ -1406,6 +1536,21 @@ class SubscriptionRepository(
                 sourceType = "SERVER_API"
             )
         )
+        val previousActiveCode = settingDao.getSetting(KEY_ACTIVE_CODE)?.value?.trim()?.uppercase()
+        if (previousActiveCode != resolvedCode && effectiveUsed == 0) {
+            settingDao.insertSetting(SettingEntity(KEY_SUB_DELETED, "0"))
+        }
+        val currentSavedCount = contactDao.getContactsCountSync()
+        val storedSubDeleted = if (previousActiveCode != resolvedCode && effectiveUsed == 0) {
+            0
+        } else {
+            settingDao.getSetting(KEY_SUB_DELETED)?.value?.toIntOrNull() ?: 0
+        }
+        val effectiveDeletedCount = maxOf(storedSubDeleted, body.deletedContactsCount)
+        if (effectiveDeletedCount > storedSubDeleted) {
+            settingDao.insertSetting(SettingEntity(KEY_SUB_DELETED, effectiveDeletedCount.toString()))
+        }
+
         settingDao.insertSetting(SettingEntity(KEY_ACTIVE_CODE, resolvedCode))
         settingDao.insertSetting(SettingEntity(KEY_SUBSCRIPTION_LOCKED, "0"))
         upsertUserProfile(snapshot, activeCode = resolvedCode)
@@ -1420,6 +1565,8 @@ class SubscriptionRepository(
             isTrial = body.isTrial,
             maxContacts = normalizedMax,
             usedContacts = effectiveUsed,
+            currentlySavedContacts = currentSavedCount,
+            deletedContacts = effectiveDeletedCount,
             activatedAt = activatedAt,
             expiresAt = expiresAt,
             boundUserId = boundUser,
@@ -1428,7 +1575,11 @@ class SubscriptionRepository(
         )
     }
 
-    private fun SubscriptionCodeEntity.toActiveInfo(snapshot: UserNetworkSnapshot? = null): ActiveSubscriptionInfo {
+    private fun SubscriptionCodeEntity.toActiveInfo(
+        snapshot: UserNetworkSnapshot? = null,
+        currentlySaved: Int = 0,
+        storedSubDeleted: Int = 0
+    ): ActiveSubscriptionInfo {
         val tier = resolvePlanTier(
             planType = label,
             planLabel = label,
@@ -1446,6 +1597,8 @@ class SubscriptionRepository(
             isTrial = isTrial,
             maxContacts = maxContacts?.takeIf { it > 0 },
             usedContacts = usedContacts,
+            currentlySavedContacts = currentlySaved,
+            deletedContacts = storedSubDeleted,
             activatedAt = activatedAt ?: System.currentTimeMillis(),
             expiresAt = expiresAt,
             boundUserId = boundUserId ?: snapshot?.userId.orEmpty(),

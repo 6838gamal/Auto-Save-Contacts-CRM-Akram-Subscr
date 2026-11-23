@@ -955,6 +955,76 @@ private data class Tuple5<A, B, C, D, E>(
 )
 
 @Composable
+fun UsageAccountingBreakdownRow(
+    currentlySaved: Int,
+    deleted: Int,
+    effectiveUsed: Int,
+    limit: Int?,
+    accentColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        UsageBreakdownCell(
+            label = "المحفوظ حالياً",
+            value = "$currentlySaved",
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f)
+        )
+        UsageBreakdownCell(
+            label = "المحذوف (محسوب)",
+            value = "$deleted",
+            color = if (deleted > 0) Color(0xFFF59E0B) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
+            modifier = Modifier.weight(1f)
+        )
+        UsageBreakdownCell(
+            label = "المحسوب فعلياً",
+            value = if (limit != null && limit > 0) "$effectiveUsed/$limit" else "$effectiveUsed",
+            color = accentColor,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun UsageBreakdownCell(
+    label: String,
+    value: String,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = color.copy(alpha = 0.08f),
+        shape = RoundedCornerShape(10.dp),
+        modifier = modifier.border(1.dp, color.copy(alpha = 0.22f), RoundedCornerShape(10.dp))
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = value,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.ExtraBold,
+                fontFamily = FontFamily.Monospace,
+                color = color
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = label,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                textAlign = TextAlign.Center,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
 fun FreeTierSensitivityCard(freeState: FreeAccessState) {
     val progress = (freeState.usedContacts.toFloat() / freeState.limit.toFloat()).coerceIn(0f, 1f)
     val accentColor = when {
@@ -1019,9 +1089,24 @@ fun FreeTierSensitivityCard(freeState: FreeAccessState) {
                 color = accentColor,
                 trackColor = accentColor.copy(alpha = 0.16f)
             )
-            Spacer(modifier = Modifier.height(6.dp))
+            if (freeState.deletedContacts > 0) {
+                Spacer(modifier = Modifier.height(10.dp))
+                UsageAccountingBreakdownRow(
+                    currentlySaved = freeState.currentlySavedContacts,
+                    deleted = freeState.deletedContacts,
+                    effectiveUsed = freeState.usedContacts,
+                    limit = freeState.limit,
+                    accentColor = accentColor,
+                    modifier = Modifier.testTag("free_tier_usage_breakdown")
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "المتاح في الوضع المجاني حتى ${freeState.limit} جهة اتصال فقط، وبعدها يلزم كود اشتراك (5 أشهر أو 12 شهراً).",
+                text = if (freeState.deletedContacts > 0) {
+                    "المتاح في الوضع المجاني حتى ${freeState.limit} جهة اتصال فقط، وتُحتسب الأرقام المحذوفة والمصدّرة ضمن الاستهلاك الفعلي لمنع تجاوز الحد."
+                } else {
+                    "المتاح في الوضع المجاني حتى ${freeState.limit} جهة اتصال فقط، وبعدها يلزم كود اشتراك (5 أشهر أو 12 شهراً)."
+                },
                 fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
                 lineHeight = 14.sp
@@ -1133,10 +1218,21 @@ fun AlreadySubscribedCountdownCard(
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color.Gray.copy(alpha = 0.15f))
             val max = info.maxContacts
             IdentityInfoRow(
-                label = "العملاء المحفوظون",
-                value = if (max != null && max > 0) "${info.usedContacts} / $max (متبقي ${info.remainingContacts()})" else "${info.usedContacts} محفوظ (ضمن الاشتراك)",
+                label = if (info.deletedContacts > 0) "الاستهلاك الفعلي للعملاء" else "العملاء المحفوظون",
+                value = if (max != null && max > 0) "${info.usedContacts} / $max (متبقي ${info.remainingContacts()})" else "${info.usedContacts} محفوظ",
                 isMonospace = false
             )
+            if (info.deletedContacts > 0) {
+                Spacer(modifier = Modifier.height(10.dp))
+                UsageAccountingBreakdownRow(
+                    currentlySaved = info.currentlySavedContacts,
+                    deleted = info.deletedContacts,
+                    effectiveUsed = info.usedContacts,
+                    limit = max?.takeIf { it > 0 },
+                    accentColor = Color(0xFF10B981),
+                    modifier = Modifier.testTag("subscribed_gate_usage_breakdown")
+                )
+            }
 
             val urgencyBanner = resolveUrgencyMessage(info.expiresAt, nowMillis)
             if (urgencyBanner != null) {
@@ -1245,7 +1341,7 @@ fun FreeUsageStatusCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(text = "الاستهلاك المجاني:", fontSize = 12.sp, color = Color.Gray)
+                Text(text = "الاستهلاك الفعلي المجاني:", fontSize = 12.sp, color = Color.Gray)
                 Text(
                     text = "${freeState.usedContacts} / ${freeState.limit} (متبقي ${freeState.remainingContacts})",
                     fontSize = 12.sp,
@@ -1264,6 +1360,24 @@ fun FreeUsageStatusCard(
                 color = accentColor,
                 trackColor = accentColor.copy(alpha = 0.14f)
             )
+            if (freeState.deletedContacts > 0) {
+                Spacer(modifier = Modifier.height(10.dp))
+                UsageAccountingBreakdownRow(
+                    currentlySaved = freeState.currentlySavedContacts,
+                    deleted = freeState.deletedContacts,
+                    effectiveUsed = freeState.usedContacts,
+                    limit = freeState.limit,
+                    accentColor = accentColor,
+                    modifier = Modifier.testTag("free_dashboard_usage_breakdown")
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "يتم احتساب الأرقام المحذوفة والمصدّرة ضمن الاستهلاك الفعلي لمنع تجاوز الحد (${freeState.limit}).",
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f),
+                    lineHeight = 14.sp
+                )
+            }
             if (isWarningTier) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
@@ -1475,7 +1589,7 @@ fun SubscriptionStatusCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(text = "حفظ العملاء:", fontSize = 12.sp, color = Color.Gray)
+                Text(text = if (info.deletedContacts > 0) "الاستهلاك الفعلي:" else "حفظ العملاء:", fontSize = 12.sp, color = Color.Gray)
                 val max = info.maxContacts
                 Text(
                     text = if (max != null && max > 0) {
@@ -1486,6 +1600,23 @@ fun SubscriptionStatusCard(
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     color = if (max != null && max > 0 && info.usedContacts >= (max * 0.9)) Color(0xFFF59E0B) else MaterialTheme.colorScheme.onSurface
+                )
+            }
+            if (info.deletedContacts > 0) {
+                Spacer(modifier = Modifier.height(8.dp))
+                UsageAccountingBreakdownRow(
+                    currentlySaved = info.currentlySavedContacts,
+                    deleted = info.deletedContacts,
+                    effectiveUsed = info.usedContacts,
+                    limit = info.maxContacts?.takeIf { it > 0 },
+                    accentColor = accentColor,
+                    modifier = Modifier.testTag("subscribed_dashboard_usage_breakdown")
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "يشمل المحفوظ حالياً + المحذوف والمصدّر بعد الحفظ",
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
                 )
             }
             Spacer(modifier = Modifier.height(6.dp))

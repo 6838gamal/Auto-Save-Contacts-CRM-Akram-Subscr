@@ -1365,4 +1365,224 @@ class SubscriptionManagerTest {
         assertTrue(exhaustedVerify.freeAccessState.isExhausted)
         assertNotNull(exhaustedVerify.errorMessage)
     }
+
+    @Test
+    fun `logs filter shows whatsapp business and whatsapp entries in both all and whatsapp tabs`() {
+        val regularWa = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
+            phone = "+967777111222",
+            source = "واتساب",
+            status = "تم الحفظ تلقائياً",
+            details = "واتساب عادي"
+        )
+        val businessWa = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
+            phone = "+967777333444",
+            source = "واتساب الأعمال",
+            status = "تم الحفظ تلقائياً",
+            details = "واتساب الأعمال"
+        )
+        val legacyAccessibilityWa = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
+            phone = "+967777555666",
+            source = "خدمة إمكانية الوصول",
+            status = "تم الحفظ تلقائياً",
+            details = "التقاط من شاشة واتساب"
+        )
+        val smsLog = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
+            phone = "+967777777888",
+            source = "رسالة SMS",
+            status = "تم الحفظ تلقائياً",
+            details = "رسالة نصية"
+        )
+        val incomingCallLog = gamalprojects.autosavecontactscrm.akramalahmadi.database.LogEntry(
+            phone = "+967777999000",
+            source = "مكالمة واردة",
+            status = "تم الحفظ تلقائياً",
+            details = "مكالمة"
+        )
+
+        val allEntries = listOf(regularWa, businessWa, legacyAccessibilityWa, smsLog, incomingCallLog)
+
+        val inAll = allEntries.filter {
+            gamalprojects.autosavecontactscrm.akramalahmadi.presentation.matchesLogFilter(it, "الكل")
+        }
+        assertEquals(5, inAll.size)
+
+        val inWhatsappTab = allEntries.filter {
+            gamalprojects.autosavecontactscrm.akramalahmadi.presentation.matchesLogFilter(it, "واتساب")
+        }
+        assertEquals(3, inWhatsappTab.size)
+        assertTrue(inWhatsappTab.contains(regularWa))
+        assertTrue(inWhatsappTab.contains(businessWa))
+        assertTrue(inWhatsappTab.contains(legacyAccessibilityWa))
+        assertFalse(inWhatsappTab.contains(smsLog))
+        assertFalse(inWhatsappTab.contains(incomingCallLog))
+    }
+
+    @Test
+    fun `deleting contacts after export never resets quota and accurately tracks saved deleted and effective usage`() = runTest {
+        val connectTelemetry = mutableListOf<SubscriptionConnectRequest>()
+        val usageTelemetry = mutableListOf<SubscriptionUsageRequest>()
+        val futureExpiry = System.currentTimeMillis() + 150L * 86_400_000L
+
+        val api = object : SubscriptionApiService {
+            override suspend fun connectAndSyncUser(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionConnectRequest
+            ): Response<SubscriptionApiResponse> {
+                connectTelemetry.add(request)
+                return Response.success(SubscriptionApiResponse(valid = true, isSubscribed = false, isActive = true))
+            }
+
+            override suspend fun activateCode(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionActivateRequest
+            ): Response<SubscriptionApiResponse> = Response.success(
+                SubscriptionApiResponse(
+                    valid = true,
+                    isSubscribed = true,
+                    isActive = true,
+                    code = request.code,
+                    plan = "5 months",
+                    maxContacts = 10,
+                    usedContacts = 0,
+                    expiresAt = futureExpiry,
+                    boundUserId = request.userId,
+                    boundIp = request.publicIp
+                )
+            )
+
+            override suspend fun verifySession(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionVerifyRequest
+            ): Response<SubscriptionApiResponse> = Response.success(
+                SubscriptionApiResponse(
+                    valid = true,
+                    isSubscribed = true,
+                    isActive = true,
+                    code = request.code,
+                    plan = "5 months",
+                    maxContacts = 10,
+                    usedContacts = request.usedQuotaCount,
+                    deletedContactsCount = request.deletedContactsCount,
+                    expiresAt = futureExpiry,
+                    boundUserId = request.userId,
+                    boundIp = request.publicIp
+                )
+            )
+
+            override suspend fun reportUsage(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionUsageRequest
+            ): Response<SubscriptionApiResponse> {
+                usageTelemetry.add(request)
+                return Response.success(SubscriptionApiResponse(valid = true, isSubscribed = true, isActive = true))
+            }
+
+            override suspend fun submitReviewRequest(
+                authorization: String?,
+                apiKey: String?,
+                request: SubscriptionReviewRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+
+            override suspend fun syncClients(
+                authorization: String?,
+                apiKey: String?,
+                request: ClientSyncBatchRequest
+            ): Response<SubscriptionApiResponse> = Response.success(SubscriptionApiResponse(valid = true))
+        }
+
+        val repo = SubscriptionRepository(db, apiServiceOverride = api)
+        val contactsRepo = ContactsRepository(db)
+
+        // 1. Free Plan: Save 60 contacts
+        for (i in 1..60) {
+            val phone = "96777100" + i.toString().padStart(4, '0')
+            assertTrue(contactsRepo.processNewConnection(context, phone, "واتساب", "رسالة $i"))
+        }
+        val stateAfter60 = repo.getFreeAccessStateSync()
+        assertEquals(60, stateAfter60.currentlySavedContacts)
+        assertEquals(0, stateAfter60.deletedContacts)
+        assertEquals(60, stateAfter60.usedContacts)
+        assertEquals(40, stateAfter60.remainingContacts)
+        assertFalse(stateAfter60.isExhausted)
+
+        // 2. Simulate user exporting & deleting 45 contacts trying to free up quota
+        val allSaved = db.contactDao().getAllContactsSync()
+        assertEquals(60, allSaved.size)
+        for (contact in allSaved.take(45)) {
+            contactsRepo.deleteContact(context, contact)
+        }
+
+        val stateAfterDelete = repo.getFreeAccessStateSync()
+        assertEquals(15, stateAfterDelete.currentlySavedContacts)
+        assertEquals(45, stateAfterDelete.deletedContacts)
+        assertEquals(60, stateAfterDelete.usedContacts)
+        assertEquals(40, stateAfterDelete.remainingContacts)
+        assertFalse(stateAfterDelete.isExhausted)
+
+        // Sync telemetry to backend and verify deleted + currently saved + effective free used
+        val verifyAfterDelete = repo.verifyCurrentSession(context)
+        assertTrue(verifyAfterDelete.isAllowed)
+        assertEquals(15, verifyAfterDelete.freeAccessState.currentlySavedContacts)
+        assertEquals(45, verifyAfterDelete.freeAccessState.deletedContacts)
+        assertEquals(60, verifyAfterDelete.freeAccessState.usedContacts)
+        val latestTelemetry = connectTelemetry.last()
+        assertEquals(15, latestTelemetry.currentlySavedCount)
+        assertEquals(45, latestTelemetry.deletedContactsCount)
+        assertEquals(60, latestTelemetry.freeContactsUsed)
+
+        // 3. Save 40 more contacts -> hits the strict 100 cumulative limit at 55 saved + 45 deleted = 100 effective!
+        for (i in 61..100) {
+            val phone = "96777100" + i.toString().padStart(4, '0')
+            assertTrue(contactsRepo.processNewConnection(context, phone, "واتساب الأعمال", "رسالة $i"))
+        }
+
+        val exhaustedState = repo.getFreeAccessStateSync()
+        assertEquals(55, exhaustedState.currentlySavedContacts)
+        assertEquals(45, exhaustedState.deletedContacts)
+        assertEquals(100, exhaustedState.usedContacts)
+        assertEquals(0, exhaustedState.remainingContacts)
+        assertTrue(exhaustedState.isExhausted)
+        assertFalse(repo.canSaveNewContact())
+
+        // Attempt #101 MUST be blocked even though only 55 contacts exist in contacts_table!
+        assertFalse(contactsRepo.processNewConnection(context, "967771009999", "واتساب", "تجاوز"))
+        assertEquals(55, db.contactDao().getContactsCountSync())
+
+        // 4. Paid subscription with maxContacts = 10: save 6, delete 4 -> effective remains 6 (only 4 remaining)
+        val actResult = repo.activateSubscriptionCode(context, "CAP-10-SUB")
+        assertTrue(actResult is ActivationResult.Success)
+        val subAfterActivate = (actResult as ActivationResult.Success).info
+        assertEquals(55, subAfterActivate.currentlySavedContacts)
+        assertEquals(0, subAfterActivate.deletedContacts)
+        assertEquals(0, subAfterActivate.usedContacts)
+
+        repeat(6) {
+            assertTrue(repo.canSaveNewContact())
+            assertTrue(repo.recordContactSaved(context))
+        }
+        repeat(4) {
+            repo.recordContactDeleted(context)
+        }
+
+        val verifiedPaid = repo.verifyCurrentSession(context)
+        assertTrue(verifiedPaid.isAllowed)
+        assertNotNull(verifiedPaid.activeInfo)
+        assertEquals(6, verifiedPaid.activeInfo!!.usedContacts)
+        assertEquals(4, verifiedPaid.activeInfo!!.deletedContacts)
+        assertEquals(4, verifiedPaid.activeInfo!!.remainingContacts())
+        assertTrue(usageTelemetry.last().deletedContactsCount == 4)
+
+        // Saving 4 more exhausts the paid 10-contact cap (cumulative 10, not 6)
+        repeat(3) {
+            assertTrue(repo.canSaveNewContact())
+            assertTrue(repo.recordContactSaved(context))
+        }
+        assertTrue(repo.canSaveNewContact())
+        assertFalse(repo.recordContactSaved(context))
+        assertFalse(repo.canSaveNewContact())
+    }
 }

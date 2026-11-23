@@ -23,13 +23,27 @@ class ContactAccessibilityService : AccessibilityService() {
         val db = AppDatabase.getDatabase(this)
         repo = ContactsRepository(db)
         Log.d("ContactAccessibility", "Accessibility Service Created")
+        AutoSaveForegroundService.startIfEnabled(applicationContext)
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.d("ContactAccessibility", "Accessibility Service Connected")
+        AutoSaveForegroundService.startIfEnabled(applicationContext)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString() ?: return
 
-        // Only monitor WhatsApp or Dialer layouts to preserve battery
-        if (packageName == "com.whatsapp" || packageName.contains("dialer") || packageName.contains("phone")) {
+        val sourceLabel = when {
+            packageName == "com.whatsapp" -> "واتساب"
+            packageName == "com.whatsapp.w4b" -> "واتساب الأعمال"
+            packageName.contains("dialer") || packageName.contains("phone") -> "مكالمة / الهاتف"
+            else -> null
+        }
+
+        // Only monitor WhatsApp, WhatsApp Business, or Dialer layouts to preserve battery
+        if (sourceLabel != null) {
             val rootNode = rootInActiveWindow ?: return
             val candidates = LinkedHashSet<String>()
             collectCandidateNumbers(rootNode, candidates)
@@ -54,12 +68,12 @@ class ContactAccessibilityService : AccessibilityService() {
 
             scope.launch {
                 for (potentialNumber in toProcess) {
-                    Log.d("ContactAccessibility", "Detected potential number in UI: $potentialNumber")
+                    Log.d("ContactAccessibility", "Detected potential number in $sourceLabel UI: $potentialNumber")
                     repo.processNewConnection(
                         applicationContext,
                         potentialNumber,
-                        "خدمة إمكانية الوصول",
-                        "التقاط مباشر من الشاشة"
+                        sourceLabel,
+                        "التقاط من شاشة $sourceLabel"
                     )
                 }
             }
@@ -83,27 +97,39 @@ class ContactAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Checks if a string looks specifically like a Yemen or general mobile phone number.
-     * Starts with + or 967 or 77/73/71/70 and has 9 digits, or is formatted with spaces.
+     * Checks if a string looks specifically like a Yemen or international mobile phone number.
      */
     private fun extractRawNumberIfValid(text: String): String? {
-        val cleaned = text.replace(Regex("[^0-9+]"), "")
-        if (cleaned.length < 8 || cleaned.length > 15) return null
-
         // Avoid alphabetic texts
         if (text.any { it.isLetter() }) return null
 
-        // Check format matches common Yemen numbers (e.g., starts with 77, 73, 71, 70, 78 or with state prefix)
-        val plainDigits = text.replace(Regex("[^0-9]"), "")
-        
-        // Match Yemen Mobile 9-digit formats (77xxxxxxx, 73xxxxxxx, 71xxxxxxx, 70xxxxxxx)
-        if (plainDigits.length == 9 && (plainDigits.startsWith("77") || plainDigits.startsWith("73") || plainDigits.startsWith("71") || plainDigits.startsWith("70"))) {
-            return text
+        val cleaned = PhoneNumberUtils.cleanNumber(text)
+        if (cleaned.length < 8 || cleaned.length > 16) return null
+
+        val plainDigits = cleaned.removePrefix("+")
+
+        // Match Yemen Mobile 9-digit formats (77, 78, 73, 71, 70)
+        if (plainDigits.length == 9 && (
+                plainDigits.startsWith("77") ||
+                    plainDigits.startsWith("78") ||
+                    plainDigits.startsWith("73") ||
+                    plainDigits.startsWith("71") ||
+                    plainDigits.startsWith("70")
+                )
+        ) {
+            return cleaned
         }
 
-        // Match normalized international lengths (e.g. 967777777777)
-        if (plainDigits.startsWith("967") && plainDigits.length == 12) {
-            return text
+        // Match Yemen international lengths (967xxxxxxxxx or 00967xxxxxxxxx)
+        if ((plainDigits.startsWith("967") && plainDigits.length == 12) ||
+            (plainDigits.startsWith("00967") && plainDigits.length == 14)
+        ) {
+            return cleaned
+        }
+
+        // Match explicit international format starting with + (e.g. +966..., +20..., +971...)
+        if (cleaned.startsWith("+") && plainDigits.length in 10..15) {
+            return cleaned
         }
 
         return null
